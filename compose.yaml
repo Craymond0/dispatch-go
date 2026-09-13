@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: dispatch
+      POSTGRES_PASSWORD: dispatch
+      POSTGRES_DB: dispatch
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dispatch"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  api:
+    build: .
+    ports: ["127.0.0.1:8088:8080"]
+    environment: &env
+      DATABASE_URL: postgres://dispatch:dispatch@db:5432/dispatch?sslmode=disable
+      DEMO_MODE: "1"
+    depends_on:
+      db: {condition: service_healthy}
+  worker:
+    build: .
+    environment:
+      <<: *env
+      ROLE: worker
+    depends_on:
+      api: {condition: service_started}
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    ports: ["127.0.0.1:9098:9090"]
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+volumes:
+  pgdata:

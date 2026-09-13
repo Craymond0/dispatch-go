@@ -1,0 +1,26 @@
+# Paid resources: review Render's total before clicking Apply.
+services:
+  - type: web
+    name: raymond-dispatch-api
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: {name: raymond-dispatch-db, property: connectionString}
+      - key: API_TOKEN
+        generateValue: true
+  - type: worker
+    name: raymond-dispatch-worker
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: {name: raymond-dispatch-db, property: connectionString}
+      - key: ROLE
+        value: worker
+databases:
+  - name: raymond-dispatch-db
+    plan: basic-256mb
+    postgresMajorVersion: "17"
+    ipAllowList: []
