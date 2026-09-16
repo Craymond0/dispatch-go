@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -60,23 +59,56 @@ func write(w http.ResponseWriter, status int, v any) {
 
 var skills = []string{"Go", "Python", "C++", "C", "Java", "JavaScript", "TypeScript", "SQL", "PostgreSQL", "Docker", "Kubernetes", "React", "Linux", "AWS", "PX4", "ArduPilot", "MATLAB", "UART", "CAN", "I2C", "SPI"}
 
-// skillPatterns is compiled once at startup. Compiling inside analyze() cost
-// 21 regexp compilations per job.
-var skillPatterns = func() []*regexp.Regexp {
-	ps := make([]*regexp.Regexp, len(skills))
+// skillIndex maps a lower-cased term to its position in skills so output
+// order is stable regardless of where the term appears in the text.
+var skillIndex = func() map[string]int {
+	m := make(map[string]int, len(skills))
 	for i, s := range skills {
-		ps[i] = regexp.MustCompile(`(?i)(^|[^a-z0-9_+])` + regexp.QuoteMeta(s) + `($|[^a-z0-9_+])`)
+		m[strings.ToLower(s)] = i
 	}
-	return ps
+	return m
 }()
 
-func analyze(p Payload) map[string]any {
-	found := []string{}
-	for i, re := range skillPatterns {
-		if re.MatchString(p.Description) {
-			found = append(found, skills[i])
+// isTermByte reports whether b can be part of a term. This is the complement
+// of the boundary class [^a-z0-9_+] used by the original regex, evaluated
+// case-insensitively, so non-ASCII bytes are boundaries as before.
+func isTermByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_' || b == '+'
+}
+
+// matchTerms scans the text once and returns the skills that appear as
+// whole tokens, where a token is a maximal run of term bytes. Every term in
+// skills is made only of term bytes, so this is equivalent to matching
+// (?i)(^|[^a-z0-9_+])TERM($|[^a-z0-9_+]) for each term, but in one pass.
+func matchTerms(text string) []string {
+	seen := make([]bool, len(skills))
+	n := 0
+	for i := 0; i < len(text); {
+		if !isTermByte(text[i]) {
+			i++
+			continue
+		}
+		j := i
+		for j < len(text) && isTermByte(text[j]) {
+			j++
+		}
+		if idx, ok := skillIndex[strings.ToLower(text[i:j])]; ok && !seen[idx] {
+			seen[idx] = true
+			n++
+		}
+		i = j
+	}
+	found := make([]string, 0, n)
+	for i, s := range skills {
+		if seen[i] {
+			found = append(found, s)
 		}
 	}
+	return found
+}
+
+func analyze(p Payload) map[string]any {
+	found := matchTerms(p.Description)
 	return map[string]any{"company": p.Company, "title": p.Title, "technical_terms": found, "word_count": len(strings.Fields(p.Description)), "method": "literal dictionary matching; not a qualification or fit score"}
 }
 func (a App) create(w http.ResponseWriter, r *http.Request) {
