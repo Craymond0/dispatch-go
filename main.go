@@ -57,12 +57,24 @@ func write(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
 }
+
+var skills = []string{"Go", "Python", "C++", "C", "Java", "JavaScript", "TypeScript", "SQL", "PostgreSQL", "Docker", "Kubernetes", "React", "Linux", "AWS", "PX4", "ArduPilot", "MATLAB", "UART", "CAN", "I2C", "SPI"}
+
+// skillPatterns is compiled once at startup. Compiling inside analyze() cost
+// 21 regexp compilations per job.
+var skillPatterns = func() []*regexp.Regexp {
+	ps := make([]*regexp.Regexp, len(skills))
+	for i, s := range skills {
+		ps[i] = regexp.MustCompile(`(?i)(^|[^a-z0-9_+])` + regexp.QuoteMeta(s) + `($|[^a-z0-9_+])`)
+	}
+	return ps
+}()
+
 func analyze(p Payload) map[string]any {
-	skills := []string{"Go", "Python", "C++", "C", "Java", "JavaScript", "TypeScript", "SQL", "PostgreSQL", "Docker", "Kubernetes", "React", "Linux", "AWS", "PX4", "ArduPilot", "MATLAB", "UART", "CAN", "I2C", "SPI"}
 	found := []string{}
-	for _, s := range skills {
-		if regexp.MustCompile(`(?i)(^|[^a-z0-9_+])` + regexp.QuoteMeta(s) + `($|[^a-z0-9_+])`).MatchString(p.Description) {
-			found = append(found, s)
+	for i, re := range skillPatterns {
+		if re.MatchString(p.Description) {
+			found = append(found, skills[i])
 		}
 	}
 	return map[string]any{"company": p.Company, "title": p.Title, "technical_terms": found, "word_count": len(strings.Fields(p.Description)), "method": "literal dictionary matching; not a qualification or fit score"}
