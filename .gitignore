@@ -1,6 +1,15 @@
 .env
-dispatch
 *.log
+
+# The built binary at the repo root. The leading slash matters: a bare
+# "dispatch" pattern also matches the cmd/dispatch/ directory, which silently
+# kept the program's entrypoint out of the repo.
+/dispatch
+/dispatchctl
+
+# The dashboard build output; `npm --prefix web run build` regenerates it and
+# restores the .gitkeep that keeps //go:embed compiling on a fresh clone.
 internal/web/dist/*
 !internal/web/dist/.gitkeep
+
 web/node_modules/

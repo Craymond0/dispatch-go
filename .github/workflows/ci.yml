@@ -64,7 +64,26 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v5
-      - run: DOCKER_BUILDKIT=1 docker build --progress=plain -t dispatch:ci .
+      - name: build image
+        run: |
+          set +e
+          DOCKER_BUILDKIT=1 docker build --progress=plain -t dispatch:ci . 2>&1 | tee /tmp/build.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### docker build failed"
+              echo '```'
+              tail -c 6000 /tmp/build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            # Emit the tail as one annotation too: annotations are readable
+            # through the check-runs API without repo admin rights, so a
+            # failure can be diagnosed without downloading the raw log.
+            MSG=$(tail -c 2500 /tmp/build.log \
+              | python3 -c "import sys; print(sys.stdin.read().replace('%','%25').replace(chr(13),'%0D').replace(chr(10),'%0A'))")
+            echo "::error title=docker build failed::$MSG"
+          fi
+          exit $status
       - name: image serves the API and the embedded dashboard
         run: |
           set -euo pipefail
