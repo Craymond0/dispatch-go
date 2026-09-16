@@ -31,9 +31,11 @@ func write(w http.ResponseWriter, status int, v any) {
 }
 
 // submitRequest is the body of POST /jobs. type defaults to "analyze".
+// depends_on lists existing job ids this job must wait for.
 type submitRequest struct {
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
+	DependsOn []int64         `json:"depends_on"`
 }
 
 type server struct {
@@ -81,22 +83,17 @@ func (s server) create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "key too long", 400)
 		return
 	}
-	var id int64
-	var storedType string
-	var stored []byte
-	err := s.db.QueryRow(r.Context(), `INSERT INTO jobs(idempotency_key,type,payload) VALUES($1,$2,$3) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING id,type,payload`, key, req.Type, b).Scan(&id, &storedType, &stored)
-	if err != nil {
+	id, _, err := s.enqueue(r.Context(), enqueueRequest{Type: req.Type, Payload: b, Key: key, DependsOn: req.DependsOn})
+	switch {
+	case errors.Is(err, errIdempotencyConflict):
+		write(w, 409, map[string]string{"error": err.Error()})
+	case errors.Is(err, errUnknownDependency):
+		write(w, 400, map[string]string{"error": err.Error()})
+	case err != nil:
 		http.Error(w, "database unavailable", 503)
-		return
+	default:
+		write(w, 202, map[string]any{"id": id, "url": fmt.Sprintf("/jobs/%d", id)})
 	}
-	var prev any
-	json.Unmarshal(stored, &prev)
-	prevBytes, _ := json.Marshal(prev)
-	if storedType != req.Type || string(prevBytes) != string(b) {
-		write(w, 409, map[string]string{"error": "idempotency key belongs to different input"})
-		return
-	}
-	write(w, 202, map[string]any{"id": id, "url": fmt.Sprintf("/jobs/%d", id)})
 }
 
 func (s server) list(w http.ResponseWriter, r *http.Request) {
@@ -124,7 +121,16 @@ func (s server) get(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job not found", 404)
 		return
 	}
-	write(w, 200, j)
+	deps, err := s.dependencies(r.Context(), j.ID)
+	if err != nil {
+		http.Error(w, "database unavailable", 503)
+		return
+	}
+	dependsOn := make([]map[string]any, 0, len(deps))
+	for _, d := range deps {
+		dependsOn = append(dependsOn, map[string]any{"id": d.ID, "type": d.Type, "state": d.State})
+	}
+	write(w, 200, map[string]any{"id": j.ID, "type": j.Type, "state": j.State, "attempts": j.Attempts, "pending_deps": j.PendingDeps, "payload": j.Payload, "result": j.Result, "error": j.Error, "depends_on": dependsOn})
 }
 
 func (s server) metrics(w http.ResponseWriter, r *http.Request) {

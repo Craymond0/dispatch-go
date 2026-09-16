@@ -25,6 +25,12 @@ Work is pluggable. A handler implements `Validate(payload)` and `Run(ctx, job)` 
 
 `analyze` is the built-in demo handler: it finds a fixed list of technology terms in a text in a single pass (see `matchTerms`).
 
+## Dependencies
+
+A job may list `depends_on: [ids]` of jobs that already exist. It is not claimable until every one of them has reached a terminal state. Dependents are released on failure as well as success: a fan-in that never runs because one input failed hides the failure, whereas one that runs can see exactly which inputs failed (`GET /jobs/{id}` lists each dependency with its state). Handlers that need all-success semantics check that themselves.
+
+Because a job can only depend on jobs that already exist, the graph is acyclic by construction. The dependency rows are locked while the pending count is computed, so a dependency finishing at the same instant cannot be missed. Retries do not release dependents; only `succeeded` and `failed` do, whichever path produced them (a handler result, a terminal error, or the expired-lease sweep).
+
 The analyzer uses a small literal technology dictionary. It does not score candidacy, use an LLM, or imply that matching a word establishes proficiency.
 
 ## Reliability design
@@ -42,7 +48,7 @@ Local demo inputs `demo_delay_seconds` (0–30) and `demo_fail_attempts` (0–3)
 
 ## Tests
 
-`go test -race ./...` runs unit tests. Set TEST_DATABASE_URL to a dedicated disposable Postgres database to run integration tests; those tests TRUNCATE that database's jobs/events tables. They cover concurrent claims, expired leases, stale-worker fencing, retries, terminal failure, successful completion, and submission deduplication.
+`go test -race ./...` runs unit tests. Set TEST_DATABASE_URL to a dedicated disposable Postgres database to run integration tests; those tests TRUNCATE that database's jobs, events and job_dependencies tables. They cover concurrent claims, expired leases, stale-worker fencing, retries, terminal failure, successful completion, and submission deduplication.
 
 ## Deploy on Render
 
@@ -57,7 +63,7 @@ The local Prometheus container is not hosted by this blueprint. For hosted colle
 
 ## Scope
 
-This first version intentionally has no workflow dependency graph, cancellation, user accounts, priority scheduler, arbitrary code execution, or browser dashboard. Next steps are request-duration metrics, richer telemetry, versioned migrations, pagination, retention, and an authenticated application-tracker frontend. No benchmark claims should be added to a resume before measurement.
+This version has no cancellation, user accounts, priority scheduler, arbitrary code execution, or browser dashboard. Next steps are request-duration metrics, richer telemetry, versioned migrations, pagination, retention, and an authenticated application-tracker frontend. No benchmark claims should be added to a resume before measurement.
 
 ## How this was built
 

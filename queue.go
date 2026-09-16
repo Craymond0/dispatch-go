@@ -19,19 +19,31 @@ const schema = `CREATE TABLE IF NOT EXISTS jobs (
  available_at TIMESTAMPTZ NOT NULL DEFAULT now(), lease_until TIMESTAMPTZ,
  result JSONB, error TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now());
  ALTER TABLE jobs ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'analyze';
+ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pending_deps INT NOT NULL DEFAULT 0;
  CREATE INDEX IF NOT EXISTS jobs_claim ON jobs(state,available_at);
- CREATE TABLE IF NOT EXISTS events (id BIGSERIAL PRIMARY KEY,job_id BIGINT REFERENCES jobs(id),attempt INT,event TEXT,at TIMESTAMPTZ DEFAULT now());`
+ CREATE TABLE IF NOT EXISTS events (id BIGSERIAL PRIMARY KEY,job_id BIGINT REFERENCES jobs(id),attempt INT,event TEXT,at TIMESTAMPTZ DEFAULT now());
+ CREATE TABLE IF NOT EXISTS job_dependencies (job_id BIGINT NOT NULL REFERENCES jobs(id), depends_on BIGINT NOT NULL REFERENCES jobs(id), PRIMARY KEY(job_id,depends_on));
+ CREATE INDEX IF NOT EXISTS job_dependencies_depends_on ON job_dependencies(depends_on);`
+
+// releaseDependents decrements pending_deps on every job that was waiting on
+// one of the given jobs. It is called whenever a job reaches a terminal state
+// by any path. Dependents are released on failure as well as success: a
+// fan-in that waits forever because one child failed is worse than one that
+// runs and reports the failure. Handlers that need all-success semantics can
+// inspect their dependencies with App.dependencies.
+const releaseDependents = `UPDATE jobs SET pending_deps=pending_deps-1 WHERE id IN (SELECT job_id FROM job_dependencies WHERE depends_on = ANY($1::bigint[]))`
 
 const leaseDuration = 45 * time.Second
 
 type Job struct {
-	ID       int64           `json:"id"`
-	Type     string          `json:"type"`
-	State    string          `json:"state"`
-	Attempts int             `json:"attempts"`
-	Payload  json.RawMessage `json:"payload"`
-	Result   json.RawMessage `json:"result"`
-	Error    string          `json:"error"`
+	ID          int64           `json:"id"`
+	Type        string          `json:"type"`
+	State       string          `json:"state"`
+	Attempts    int             `json:"attempts"`
+	PendingDeps int             `json:"pending_deps"`
+	Payload     json.RawMessage `json:"payload"`
+	Result      json.RawMessage `json:"result"`
+	Error       string          `json:"error"`
 }
 
 type App struct{ db *pgxpool.Pool }
@@ -51,12 +63,107 @@ func isTerminal(err error) bool {
 	return errors.As(err, &t)
 }
 
-const jobColumns = `jobs.id,jobs.type,jobs.state,jobs.attempts,jobs.payload,jobs.result,jobs.error`
+const jobColumns = `jobs.id,jobs.type,jobs.state,jobs.attempts,jobs.pending_deps,jobs.payload,jobs.result,jobs.error`
 
 func scanJob(row pgx.Row) (Job, error) {
 	var j Job
-	err := row.Scan(&j.ID, &j.Type, &j.State, &j.Attempts, &j.Payload, &j.Result, &j.Error)
+	err := row.Scan(&j.ID, &j.Type, &j.State, &j.Attempts, &j.PendingDeps, &j.Payload, &j.Result, &j.Error)
 	return j, err
+}
+
+// enqueueRequest is one new job. DependsOn lists ids of existing jobs that
+// must reach a terminal state before this one becomes claimable. Because a
+// job can only depend on jobs that already exist, the dependency graph is
+// acyclic by construction.
+type enqueueRequest struct {
+	Type      string
+	Payload   []byte // canonical JSON
+	Key       string // idempotency key; derived from type+payload if empty
+	DependsOn []int64
+}
+
+var errUnknownDependency = errors.New("depends_on references a job that does not exist")
+
+// enqueue inserts a job and its dependency edges in one transaction. The
+// dependency rows are locked FOR SHARE while pending_deps is computed, so a
+// dependency cannot finish between the count and the insert: finish()'s
+// UPDATE on that row waits for this transaction to commit, and its
+// releaseDependents then sees the new edge.
+func (a App) enqueue(ctx context.Context, req enqueueRequest) (id int64, created bool, err error) {
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	defer tx.Rollback(ctx)
+	pending := 0
+	if len(req.DependsOn) > 0 {
+		rows, err := tx.Query(ctx, `SELECT id,state FROM jobs WHERE id = ANY($1::bigint[]) FOR SHARE`, req.DependsOn)
+		if err != nil {
+			return 0, false, err
+		}
+		seen := map[int64]bool{}
+		for rows.Next() {
+			var depID int64
+			var state string
+			if err := rows.Scan(&depID, &state); err != nil {
+				rows.Close()
+				return 0, false, err
+			}
+			seen[depID] = true
+			if state != "succeeded" && state != "failed" {
+				pending++
+			}
+		}
+		rows.Close()
+		for _, d := range req.DependsOn {
+			if !seen[d] {
+				return 0, false, errUnknownDependency
+			}
+		}
+	}
+	var storedType string
+	var stored []byte
+	var xmaxZero bool
+	// xmax = 0 distinguishes a fresh insert from the ON CONFLICT no-op update.
+	err = tx.QueryRow(ctx, `INSERT INTO jobs(idempotency_key,type,payload,pending_deps) VALUES($1,$2,$3,$4) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING id,type,payload,(xmax=0)`, req.Key, req.Type, req.Payload, pending).Scan(&id, &storedType, &stored, &xmaxZero)
+	if err != nil {
+		return 0, false, err
+	}
+	var prev any
+	json.Unmarshal(stored, &prev)
+	prevBytes, _ := json.Marshal(prev)
+	if storedType != req.Type || string(prevBytes) != string(req.Payload) {
+		return id, false, errIdempotencyConflict
+	}
+	if xmaxZero && len(req.DependsOn) > 0 {
+		for _, d := range req.DependsOn {
+			if _, err := tx.Exec(ctx, `INSERT INTO job_dependencies(job_id,depends_on) VALUES($1,$2) ON CONFLICT DO NOTHING`, id, d); err != nil {
+				return 0, false, err
+			}
+		}
+	}
+	return id, xmaxZero, tx.Commit(ctx)
+}
+
+var errIdempotencyConflict = errors.New("idempotency key belongs to different input")
+
+// dependencies returns the jobs the given job waited on, so a fan-in handler
+// can see which of its inputs succeeded.
+func (a App) dependencies(ctx context.Context, jobID int64) ([]Job, error) {
+	rows, err := a.db.Query(ctx, `SELECT `+jobColumns+` FROM jobs JOIN job_dependencies d ON d.depends_on=jobs.id WHERE d.job_id=$1 ORDER BY jobs.id`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var deps []Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		deps = append(deps, j)
+	}
+	return deps, rows.Err()
 }
 
 // claim atomically takes one runnable job. SKIP LOCKED lets independent
@@ -64,11 +171,12 @@ func scanJob(row pgx.Row) (Job, error) {
 // that prevents a worker whose lease expired from completing a job that has
 // since been reclaimed by someone else.
 func (a App) claim(ctx context.Context) (Job, error) {
-	_, err := a.db.Exec(ctx, `UPDATE jobs SET state='failed',error='lease expired; retry limit reached' WHERE state='running' AND lease_until<now() AND attempts>=max_attempts`)
+	_, err := a.db.Exec(ctx, `WITH expired AS (UPDATE jobs SET state='failed',error='lease expired; retry limit reached' WHERE state='running' AND lease_until<now() AND attempts>=max_attempts RETURNING id) `+
+		`UPDATE jobs SET pending_deps=pending_deps-1 WHERE id IN (SELECT job_id FROM job_dependencies WHERE depends_on IN (SELECT id FROM expired))`)
 	if err != nil {
 		return Job{}, err
 	}
-	return scanJob(a.db.QueryRow(ctx, `WITH candidate AS (SELECT id FROM jobs WHERE attempts<max_attempts AND ((state='queued' AND available_at<=now()) OR (state='running' AND lease_until<now())) ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE jobs SET state='running',attempts=attempts+1,lease_until=now()+$1::interval FROM candidate WHERE jobs.id=candidate.id RETURNING `+jobColumns, leaseDuration))
+	return scanJob(a.db.QueryRow(ctx, `WITH candidate AS (SELECT id FROM jobs WHERE pending_deps=0 AND attempts<max_attempts AND ((state='queued' AND available_at<=now()) OR (state='running' AND lease_until<now())) ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE jobs SET state='running',attempts=attempts+1,lease_until=now()+$1::interval FROM candidate WHERE jobs.id=candidate.id RETURNING `+jobColumns, leaseDuration))
 }
 
 // finish records the outcome of an attempt. A nil jobErr succeeds; a
@@ -103,6 +211,11 @@ func (a App) finish(ctx context.Context, j Job, result []byte, jobErr error) err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO events(job_id,attempt,event) VALUES($1,$2,$3)`, j.ID, j.Attempts, event); err != nil {
 		return err
+	}
+	if state == "succeeded" || state == "failed" {
+		if _, err = tx.Exec(ctx, releaseDependents, []int64{j.ID}); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }
