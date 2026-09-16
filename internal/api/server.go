@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"dispatch/internal/queue"
 )
@@ -18,8 +19,26 @@ type Server struct {
 	Q     *queue.Queue
 	Reg   *queue.Registry
 	Token string
+	// Password enables the dashboard's cookie login. SessionSecret signs the
+	// cookie; when empty a key is derived from Token.
+	Password      string
+	SessionSecret []byte
 	// Mount lets other packages add routes under the same auth.
 	Mount func(*http.ServeMux)
+	// Static serves the dashboard for any path that is not an API route.
+	Static http.Handler
+}
+
+// apiPrefixes are the routes that require auth; everything else is the SPA.
+var apiPrefixes = []string{"/jobs", "/metrics", "/tracker/", "/auth/"}
+
+func isAPI(path string) bool {
+	for _, p := range apiPrefixes {
+		if path == strings.TrimSuffix(p, "/") || strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func write(w http.ResponseWriter, status int, v any) {
@@ -43,15 +62,28 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /jobs/{id}", s.get)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("POST /auth/login", s.login)
+	mux.HandleFunc("POST /auth/logout", s.logout)
+	mux.HandleFunc("GET /auth/me", s.me)
 	if s.Mount != nil {
 		s.Mount(mux)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" && s.Token != "" && r.Header.Get("Authorization") != "Bearer "+s.Token {
-			http.Error(w, "unauthorized", 401)
-			return
+		p := r.URL.Path
+		switch {
+		case p == "/healthz" || p == "/auth/login" || p == "/auth/me":
+			mux.ServeHTTP(w, r)
+		case isAPI(p):
+			if _, ok := s.authenticated(r); !ok {
+				write(w, 401, map[string]string{"error": "unauthorized"})
+				return
+			}
+			mux.ServeHTTP(w, r)
+		case s.Static != nil:
+			s.Static.ServeHTTP(w, r)
+		default:
+			http.NotFound(w, r)
 		}
-		mux.ServeHTTP(w, r)
 	})
 }
 

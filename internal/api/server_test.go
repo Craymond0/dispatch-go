@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -96,5 +97,69 @@ func TestHTTP(t *testing.T) {
 	}
 	if w := do("GET", "/metrics", "", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `dispatch_jobs{type="analyze",state="queued"} 2`) {
 		t.Fatal("metrics:", w.Body.String())
+	}
+}
+
+func TestCookieAuth(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.Open(t, "api")
+	q := queue.New(db)
+	if err := q.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Q: q, Reg: queue.NewRegistry(), Token: "tok", Password: "pw", Static: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("SPA")) })}
+	h := s.Handler()
+	req := func(method, path, body string, cookie *http.Cookie) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		if cookie != nil {
+			r.AddCookie(cookie)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	if w := req("GET", "/", "", nil); w.Code != 200 || w.Body.String() != "SPA" {
+		t.Fatal("static should be open")
+	}
+	if w := req("GET", "/some/client/route", "", nil); w.Body.String() != "SPA" {
+		t.Fatal("SPA fallback")
+	}
+	if w := req("GET", "/jobs", "", nil); w.Code != 401 {
+		t.Fatal("API should need auth")
+	}
+	if w := req("GET", "/auth/me", "", nil); w.Code != 200 || !strings.Contains(w.Body.String(), `"authenticated":false`) {
+		t.Fatal(w.Body.String())
+	}
+	if w := req("POST", "/auth/login", `{"password":"nope"}`, nil); w.Code != 401 {
+		t.Fatal("wrong password accepted")
+	}
+	w := req("POST", "/auth/login", `{"password":"pw"}`, nil)
+	if w.Code != 200 || len(w.Result().Cookies()) != 1 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	c := w.Result().Cookies()[0]
+	if !c.HttpOnly || c.Name != sessionCookie {
+		t.Fatal("cookie flags", c)
+	}
+	if w := req("GET", "/jobs", "", c); w.Code != 200 {
+		t.Fatal("cookie should authorise", w.Code)
+	}
+	if w := req("GET", "/auth/me", "", c); !strings.Contains(w.Body.String(), `"method":"cookie"`) {
+		t.Fatal(w.Body.String())
+	}
+	forged := &http.Cookie{Name: sessionCookie, Value: strings.Replace(c.Value, "0", "1", 1)}
+	if w := req("GET", "/jobs", "", forged); w.Code != 401 {
+		t.Fatal("tampered cookie accepted")
+	}
+	w = req("POST", "/auth/logout", "", c)
+	if cl := w.Result().Cookies(); len(cl) != 1 || cl[0].MaxAge != -1 {
+		t.Fatal("logout should clear the cookie")
+	}
+	// Without DASHBOARD_PASSWORD the login route says so instead of accepting anything.
+	noPw := (&Server{Q: q, Reg: queue.NewRegistry(), Token: "tok"}).Handler()
+	rec := httptest.NewRecorder()
+	noPw.ServeHTTP(rec, httptest.NewRequest("POST", "/auth/login", strings.NewReader(`{"password":"x"}`)))
+	if rec.Code != 503 {
+		t.Fatal("login without password configured should be 503, got", rec.Code)
 	}
 }

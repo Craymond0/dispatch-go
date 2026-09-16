@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"dispatch/internal/llm"
 	"dispatch/internal/queue"
 	"dispatch/internal/testdb"
 )
@@ -24,10 +25,10 @@ func setup(t *testing.T) (*Tracker, *queue.Registry, context.Context) {
 	if err := q.MigrateExtra(ctx, Schema); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(ctx, "TRUNCATE events,job_dependencies,jobs,tracker_events,applications,postings,companies,tracker_state RESTART IDENTITY"); err != nil {
+	if _, err := db.Exec(ctx, "TRUNCATE events,job_dependencies,jobs,tracker_events,applications,fit_reports,postings,companies,tracker_state RESTART IDENTITY"); err != nil {
 		t.Fatal(err)
 	}
-	tr := &Tracker{Q: q, HTTP: http.DefaultClient}
+	tr := &Tracker{Q: q, HTTP: http.DefaultClient, LLM: &llm.Client{}}
 	reg := queue.NewRegistry()
 	tr.Register(reg)
 	return tr, reg, ctx

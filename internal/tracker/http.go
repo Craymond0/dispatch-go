@@ -51,12 +51,13 @@ func (t *Tracker) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /tracker/digest", t.latestDigest)
 	mux.HandleFunc("POST /tracker/sweep", t.startSweep)
 	mux.HandleFunc("GET /tracker/status", t.status)
+	t.fitRoutes(mux)
 }
 
 // status is the one call a dashboard makes on load.
 func (t *Tracker) status(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	out := map[string]any{"email_configured": t.Email.configured()}
+	out := map[string]any{"email_configured": t.Email.configured(), "llm_configured": t.LLM.Configured(), "resume_stored": t.getState(ctx, "resume.master") != ""}
 	var open, tracked, followed, apps int
 	t.db().QueryRow(ctx, `SELECT count(*) FILTER (WHERE state='open'), count(*) FILTER (WHERE tracked AND state='open') FROM postings`).Scan(&open, &tracked)
 	t.db().QueryRow(ctx, `SELECT count(*) FROM companies WHERE followed`).Scan(&followed)

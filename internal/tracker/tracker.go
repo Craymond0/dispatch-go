@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"dispatch/internal/llm"
 	"dispatch/internal/queue"
 )
 
@@ -71,7 +72,7 @@ CREATE TABLE IF NOT EXISTS tracker_events (
   at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS tracker_events_at ON tracker_events(at DESC);
 CREATE TABLE IF NOT EXISTS tracker_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
-`
+` + fitSchema
 
 // Tracker holds the dependencies the job handlers need. Base URLs are fields
 // so tests can point them at httptest servers.
@@ -86,6 +87,8 @@ type Tracker struct {
 
 	// Email is digest delivery; zero value means off.
 	Email Email
+	// LLM backs the fit analysis; unconfigured means the endpoint returns 503.
+	LLM *llm.Client
 	// SweepInterval is how often the scheduled sweep runs.
 	SweepInterval time.Duration
 
@@ -102,6 +105,7 @@ func Defaults(q *queue.Queue) *Tracker {
 		LeverBase:      "https://api.lever.co/v0/postings/",
 		AshbyBase:      "https://api.ashbyhq.com/posting-api/job-board/",
 		SweepInterval:  6 * time.Hour,
+		LLM:            &llm.Client{},
 		limiter:        newHostLimiter(2, 4), // 2 req/s per host, burst 4
 	}
 }
