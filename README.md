@@ -1,6 +1,6 @@
 # Dispatch
 
-[![ci](https://github.com/OWNER/dispatch-go/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/dispatch-go/actions/workflows/ci.yml)
+[![ci](https://github.com/Craymond0/dispatch-go/actions/workflows/ci.yml/badge.svg)](https://github.com/Craymond0/dispatch-go/actions/workflows/ci.yml)
 
 A Go/PostgreSQL background-job service for analyzing saved job descriptions. This is an API project, not yet a full application tracker or browser dashboard.
 
