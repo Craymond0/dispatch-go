@@ -6,13 +6,22 @@ A Go/PostgreSQL background-job service for analyzing saved job descriptions. Thi
 
 Install/start Docker Desktop, then run `docker compose -p raymond-dispatch up --build -d --scale worker=2` in this folder.
 
-API: http://localhost:8088/healthz. Prometheus: http://localhost:9098. Submit a description with POST /jobs; poll GET /jobs/{id}. GET /jobs lists the latest 100 jobs. GET /metrics exports job-state counts and retry totals.
+API: http://localhost:8088/healthz. Prometheus: http://localhost:9098. Submit a job with POST /jobs; poll GET /jobs/{id}. GET /jobs lists the latest 100 jobs. GET /metrics exports job counts by type and state plus retry totals.
+
+A job is `{"type": "<handler name>", "payload": {...}}`. `type` defaults to `analyze`. Each handler validates its own payload at submission, so a bad payload is a 400, not a failed job. Unknown types are rejected with the list of registered handlers.
 
 Example (local demo):
 
 ```sh
-curl -X POST http://localhost:8088/jobs -H 'Content-Type: application/json' -H 'Idempotency-Key: example-1' -d '{"company":"Example","title":"Software Engineer","description":"Go, Python, PostgreSQL, Docker and Linux"}'
+curl -X POST http://localhost:8088/jobs -H 'Content-Type: application/json' -H 'Idempotency-Key: example-1' \
+  -d '{"type":"analyze","payload":{"company":"Example","title":"Software Engineer","description":"Go, Python, PostgreSQL, Docker and Linux"}}'
 ```
+
+## Handlers
+
+Work is pluggable. A handler implements `Validate(payload)` and `Run(ctx, job)` and is registered by name in `newRegistry()`. The worker looks up the handler by the job's `type`; a job whose type has no handler in the running binary fails terminally rather than retrying against the same binary forever.
+
+`analyze` is the built-in demo handler: it finds a fixed list of technology terms in a text in a single pass (see `matchTerms`).
 
 The analyzer uses a small literal technology dictionary. It does not score candidacy, use an LLM, or imply that matching a word establishes proficiency.
 
@@ -22,8 +31,8 @@ The analyzer uses a small literal technology dictionary. It does not score candi
 - Atomic claims use row locks and SKIP LOCKED across independent workers.
 - 45-second leases reclaim abandoned work after a crash. The current workload is bounded to 30 seconds; there is no lease renewal for arbitrary long-running jobs.
 - Attempt numbers fence stale workers from committing results after reassignment.
-- Failures retry with exponential delays up to three attempts, then remain visible as failed jobs.
-- Idempotency keys deduplicate submissions and reject a different payload using the same key.
+- Failures retry with exponential delays up to three attempts, then remain visible as failed jobs. A handler can return `Terminal(err)` for failures that retrying cannot fix (malformed input, a permanent 404); those fail on the spot with a `failed_terminal` event and no further attempts.
+- Idempotency keys deduplicate submissions and reject a different type or payload using the same key. Without a key, one is derived from the type and the canonicalised payload, so key order in the JSON does not matter.
 - Delivery is at least once. Database result writes are fenced; external side effects would need their own idempotency design.
 - Structured JSON logs include job ID and attempt. Prometheus metrics are durable database-derived state and retry counts. Distributed tracing and a Grafana dashboard are future work.
 
