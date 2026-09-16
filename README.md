@@ -1,5 +1,7 @@
 # Dispatch
 
+[![ci](https://github.com/OWNER/dispatch-go/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/dispatch-go/actions/workflows/ci.yml)
+
 A Go/PostgreSQL background-job service for analyzing saved job descriptions. This is an API project, not yet a full application tracker or browser dashboard.
 
 ## Run locally
@@ -56,3 +58,7 @@ The local Prometheus container is not hosted by this blueprint. For hosted colle
 ## Scope
 
 This first version intentionally has no workflow dependency graph, cancellation, user accounts, priority scheduler, arbitrary code execution, or browser dashboard. Next steps are request-duration metrics, richer telemetry, versioned migrations, pagination, retention, and an authenticated application-tracker frontend. No benchmark claims should be added to a resume before measurement.
+
+## How this was built
+
+The first commit was scaffolded in a ChatGPT session. Everything after it (the handler registry, the single-pass matcher, the dependency graph, the tracker, CI) was developed with Claude Code, with design decisions and their reasoning recorded in `TRACKER_SPEC.md`. Direction, review, and the decisions are mine.
