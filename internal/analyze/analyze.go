@@ -1,4 +1,7 @@
-package main
+// Package analyze is the original demo workload: find a fixed list of
+// technology terms in a text. It exists to give the queue something to run
+// and to exercise the retry and lease paths via demo controls.
+package analyze
 
 import (
 	"context"
@@ -6,46 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"time"
+
+	"dispatch/internal/queue"
 )
-
-// Handler does the work for one job type. Validate runs at submission so a
-// bad payload is rejected with a 400 instead of failing later on a worker.
-// Run executes the job; return a TerminalError for failures that must not be
-// retried (a malformed input, a 404) and any other error to retry with
-// backoff.
-type Handler interface {
-	Validate(payload json.RawMessage) error
-	Run(ctx context.Context, j Job) ([]byte, error)
-}
-
-// Registry maps job types to handlers. It is populated once at startup and
-// read concurrently by workers, so it has no locking.
-type Registry struct{ m map[string]Handler }
-
-func NewRegistry() *Registry { return &Registry{m: map[string]Handler{}} }
-
-func (r *Registry) Register(name string, h Handler) {
-	if _, dup := r.m[name]; dup {
-		panic("handler registered twice: " + name)
-	}
-	r.m[name] = h
-}
-
-func (r *Registry) Get(name string) (Handler, bool) { h, ok := r.m[name]; return h, ok }
-
-func (r *Registry) Names() []string {
-	names := make([]string, 0, len(r.m))
-	for n := range r.m {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	return names
-}
-
-// --- analyze: the original demo workload ------------------------------------
 
 // Payload is the analyze job's input. The demo_* fields inject delay and
 // failure so the retry and lease paths can be exercised by hand; they are
@@ -58,13 +26,14 @@ type Payload struct {
 	FailUntil   int    `json:"demo_fail_attempts,omitempty"`
 }
 
-var skills = []string{"Go", "Python", "C++", "C", "Java", "JavaScript", "TypeScript", "SQL", "PostgreSQL", "Docker", "Kubernetes", "React", "Linux", "AWS", "PX4", "ArduPilot", "MATLAB", "UART", "CAN", "I2C", "SPI"}
+// Skills is the fixed term dictionary; exported so tests can reference it.
+var Skills = []string{"Go", "Python", "C++", "C", "Java", "JavaScript", "TypeScript", "SQL", "PostgreSQL", "Docker", "Kubernetes", "React", "Linux", "AWS", "PX4", "ArduPilot", "MATLAB", "UART", "CAN", "I2C", "SPI"}
 
-// skillIndex maps a lower-cased term to its position in skills so output
+// skillIndex maps a lower-cased term to its position in Skills so output
 // order is stable regardless of where the term appears in the text.
 var skillIndex = func() map[string]int {
-	m := make(map[string]int, len(skills))
-	for i, s := range skills {
+	m := make(map[string]int, len(Skills))
+	for i, s := range Skills {
 		m[strings.ToLower(s)] = i
 	}
 	return m
@@ -77,12 +46,12 @@ func isTermByte(b byte) bool {
 	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_' || b == '+'
 }
 
-// matchTerms scans the text once and returns the skills that appear as
+// matchTerms scans the text once and returns the Skills that appear as
 // whole tokens, where a token is a maximal run of term bytes. Every term in
-// skills is made only of term bytes, so this is equivalent to matching
+// Skills is made only of term bytes, so this is equivalent to matching
 // (?i)(^|[^a-z0-9_+])TERM($|[^a-z0-9_+]) for each term, but in one pass.
-func matchTerms(text string) []string {
-	seen := make([]bool, len(skills))
+func MatchTerms(text string) []string {
+	seen := make([]bool, len(Skills))
 	n := 0
 	for i := 0; i < len(text); {
 		if !isTermByte(text[i]) {
@@ -100,7 +69,7 @@ func matchTerms(text string) []string {
 		i = j
 	}
 	found := make([]string, 0, n)
-	for i, s := range skills {
+	for i, s := range Skills {
 		if seen[i] {
 			found = append(found, s)
 		}
@@ -108,12 +77,13 @@ func matchTerms(text string) []string {
 	return found
 }
 
-func analyze(p Payload) map[string]any {
-	found := matchTerms(p.Description)
+func Analyze(p Payload) map[string]any {
+	found := MatchTerms(p.Description)
 	return map[string]any{"company": p.Company, "title": p.Title, "technical_terms": found, "word_count": len(strings.Fields(p.Description)), "method": "literal dictionary matching; not a qualification or fit score"}
 }
 
-type analyzeHandler struct{}
+// Handler is the queue handler for the "analyze" job type.
+type Handler struct{}
 
 func decodePayload(raw json.RawMessage) (Payload, error) {
 	var p Payload
@@ -125,7 +95,7 @@ func decodePayload(raw json.RawMessage) (Payload, error) {
 	return p, nil
 }
 
-func (analyzeHandler) Validate(raw json.RawMessage) error {
+func (Handler) Validate(raw json.RawMessage) error {
 	p, err := decodePayload(raw)
 	if err != nil {
 		return err
@@ -139,10 +109,10 @@ func (analyzeHandler) Validate(raw json.RawMessage) error {
 	return nil
 }
 
-func (analyzeHandler) Run(ctx context.Context, j Job) ([]byte, error) {
+func (Handler) Run(ctx context.Context, j queue.Job) ([]byte, error) {
 	p, err := decodePayload(j.Payload)
 	if err != nil {
-		return nil, Terminal(err) // validated at submit; a decode failure here means corrupt storage, not a transient fault
+		return nil, queue.Terminal(err) // validated at submit; a decode failure here means corrupt storage, not a transient fault
 	}
 	select {
 	case <-ctx.Done():
@@ -152,5 +122,5 @@ func (analyzeHandler) Run(ctx context.Context, j Job) ([]byte, error) {
 	if j.Attempts <= p.FailUntil {
 		return nil, errors.New("injected demo failure")
 	}
-	return json.Marshal(analyze(p))
+	return json.Marshal(Analyze(p))
 }

@@ -19,6 +19,15 @@ curl -X POST http://localhost:8088/jobs -H 'Content-Type: application/json' -H '
   -d '{"type":"analyze","payload":{"company":"Example","title":"Software Engineer","description":"Go, Python, PostgreSQL, Docker and Linux"}}'
 ```
 
+## Layout
+
+```
+cmd/dispatch/       the binary: API by default, worker with ROLE=worker
+internal/queue/     the engine: schema, claim/finish, dependencies, handler registry
+internal/analyze/   the demo handler (term matching)
+internal/api/       HTTP surface over the queue
+```
+
 ## Handlers
 
 Work is pluggable. A handler implements `Validate(payload)` and `Run(ctx, job)` and is registered by name in `newRegistry()`. The worker looks up the handler by the job's `type`; a job whose type has no handler in the running binary fails terminally rather than retrying against the same binary forever.

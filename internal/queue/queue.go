@@ -1,4 +1,4 @@
-package main
+package queue
 
 import (
 	"context"
@@ -30,7 +30,7 @@ const schema = `CREATE TABLE IF NOT EXISTS jobs (
 // by any path. Dependents are released on failure as well as success: a
 // fan-in that waits forever because one child failed is worse than one that
 // runs and reports the failure. Handlers that need all-success semantics can
-// inspect their dependencies with App.dependencies.
+// inspect their dependencies with Queue.Dependencies.
 const releaseDependents = `UPDATE jobs SET pending_deps=pending_deps-1 WHERE id IN (SELECT job_id FROM job_dependencies WHERE depends_on = ANY($1::bigint[]))`
 
 const leaseDuration = 45 * time.Second
@@ -46,7 +46,50 @@ type Job struct {
 	Error       string          `json:"error"`
 }
 
-type App struct{ db *pgxpool.Pool }
+// Queue is the job engine over one Postgres pool.
+type Queue struct{ db *pgxpool.Pool }
+
+func New(db *pgxpool.Pool) *Queue { return &Queue{db: db} }
+
+// Migrate applies the schema. An advisory lock serialises it across API and
+// worker processes starting at the same time.
+func (q *Queue) Migrate(ctx context.Context) error {
+	tx, err := q.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(314159)`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, schema); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// Exec runs one statement outside the engine, for other packages that own
+// tables in the same database (their migrations run under the same lock).
+func (q *Queue) MigrateExtra(ctx context.Context, sql string) error {
+	tx, err := q.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(314159)`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, sql); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// DB exposes the pool for packages that store their own tables alongside jobs.
+func (q *Queue) DB() *pgxpool.Pool { return q.db }
+
+// Ping reports database reachability for health checks.
+func (q *Queue) Ping(ctx context.Context) error { return q.db.Ping(ctx) }
 
 // TerminalError wraps a failure that retrying cannot fix. finish() moves the
 // job straight to failed instead of scheduling another attempt.
@@ -58,14 +101,14 @@ func (e *TerminalError) Unwrap() error { return e.Err }
 // Terminal marks err as not retryable.
 func Terminal(err error) error { return &TerminalError{Err: err} }
 
-func isTerminal(err error) bool {
+func IsTerminal(err error) bool {
 	var t *TerminalError
 	return errors.As(err, &t)
 }
 
-const jobColumns = `jobs.id,jobs.type,jobs.state,jobs.attempts,jobs.pending_deps,jobs.payload,jobs.result,jobs.error`
+const JobColumns = `jobs.id,jobs.type,jobs.state,jobs.attempts,jobs.pending_deps,jobs.payload,jobs.result,jobs.error`
 
-func scanJob(row pgx.Row) (Job, error) {
+func ScanJob(row pgx.Row) (Job, error) {
 	var j Job
 	err := row.Scan(&j.ID, &j.Type, &j.State, &j.Attempts, &j.PendingDeps, &j.Payload, &j.Result, &j.Error)
 	return j, err
@@ -75,22 +118,22 @@ func scanJob(row pgx.Row) (Job, error) {
 // must reach a terminal state before this one becomes claimable. Because a
 // job can only depend on jobs that already exist, the dependency graph is
 // acyclic by construction.
-type enqueueRequest struct {
+type EnqueueRequest struct {
 	Type      string
 	Payload   []byte // canonical JSON
 	Key       string // idempotency key; derived from type+payload if empty
 	DependsOn []int64
 }
 
-var errUnknownDependency = errors.New("depends_on references a job that does not exist")
+var ErrUnknownDependency = errors.New("depends_on references a job that does not exist")
 
 // enqueue inserts a job and its dependency edges in one transaction. The
 // dependency rows are locked FOR SHARE while pending_deps is computed, so a
 // dependency cannot finish between the count and the insert: finish()'s
 // UPDATE on that row waits for this transaction to commit, and its
 // releaseDependents then sees the new edge.
-func (a App) enqueue(ctx context.Context, req enqueueRequest) (id int64, created bool, err error) {
-	tx, err := a.db.Begin(ctx)
+func (q *Queue) Enqueue(ctx context.Context, req EnqueueRequest) (id int64, created bool, err error) {
+	tx, err := q.db.Begin(ctx)
 	if err != nil {
 		return 0, false, err
 	}
@@ -117,7 +160,7 @@ func (a App) enqueue(ctx context.Context, req enqueueRequest) (id int64, created
 		rows.Close()
 		for _, d := range req.DependsOn {
 			if !seen[d] {
-				return 0, false, errUnknownDependency
+				return 0, false, ErrUnknownDependency
 			}
 		}
 	}
@@ -133,7 +176,7 @@ func (a App) enqueue(ctx context.Context, req enqueueRequest) (id int64, created
 	json.Unmarshal(stored, &prev)
 	prevBytes, _ := json.Marshal(prev)
 	if storedType != req.Type || string(prevBytes) != string(req.Payload) {
-		return id, false, errIdempotencyConflict
+		return id, false, ErrIdempotencyConflict
 	}
 	if xmaxZero && len(req.DependsOn) > 0 {
 		for _, d := range req.DependsOn {
@@ -145,19 +188,19 @@ func (a App) enqueue(ctx context.Context, req enqueueRequest) (id int64, created
 	return id, xmaxZero, tx.Commit(ctx)
 }
 
-var errIdempotencyConflict = errors.New("idempotency key belongs to different input")
+var ErrIdempotencyConflict = errors.New("idempotency key belongs to different input")
 
 // dependencies returns the jobs the given job waited on, so a fan-in handler
 // can see which of its inputs succeeded.
-func (a App) dependencies(ctx context.Context, jobID int64) ([]Job, error) {
-	rows, err := a.db.Query(ctx, `SELECT `+jobColumns+` FROM jobs JOIN job_dependencies d ON d.depends_on=jobs.id WHERE d.job_id=$1 ORDER BY jobs.id`, jobID)
+func (q *Queue) Dependencies(ctx context.Context, jobID int64) ([]Job, error) {
+	rows, err := q.db.Query(ctx, `SELECT `+JobColumns+` FROM jobs JOIN job_dependencies d ON d.depends_on=jobs.id WHERE d.job_id=$1 ORDER BY jobs.id`, jobID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var deps []Job
 	for rows.Next() {
-		j, err := scanJob(rows)
+		j, err := ScanJob(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -170,26 +213,26 @@ func (a App) dependencies(ctx context.Context, jobID int64) ([]Job, error) {
 // workers contend without blocking each other; attempts is the fencing token
 // that prevents a worker whose lease expired from completing a job that has
 // since been reclaimed by someone else.
-func (a App) claim(ctx context.Context) (Job, error) {
-	_, err := a.db.Exec(ctx, `WITH expired AS (UPDATE jobs SET state='failed',error='lease expired; retry limit reached' WHERE state='running' AND lease_until<now() AND attempts>=max_attempts RETURNING id) `+
+func (q *Queue) Claim(ctx context.Context) (Job, error) {
+	_, err := q.db.Exec(ctx, `WITH expired AS (UPDATE jobs SET state='failed',error='lease expired; retry limit reached' WHERE state='running' AND lease_until<now() AND attempts>=max_attempts RETURNING id) `+
 		`UPDATE jobs SET pending_deps=pending_deps-1 WHERE id IN (SELECT job_id FROM job_dependencies WHERE depends_on IN (SELECT id FROM expired))`)
 	if err != nil {
 		return Job{}, err
 	}
-	return scanJob(a.db.QueryRow(ctx, `WITH candidate AS (SELECT id FROM jobs WHERE pending_deps=0 AND attempts<max_attempts AND ((state='queued' AND available_at<=now()) OR (state='running' AND lease_until<now())) ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE jobs SET state='running',attempts=attempts+1,lease_until=now()+$1::interval FROM candidate WHERE jobs.id=candidate.id RETURNING `+jobColumns, leaseDuration))
+	return ScanJob(q.db.QueryRow(ctx, `WITH candidate AS (SELECT id FROM jobs WHERE pending_deps=0 AND attempts<max_attempts AND ((state='queued' AND available_at<=now()) OR (state='running' AND lease_until<now())) ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE jobs SET state='running',attempts=attempts+1,lease_until=now()+$1::interval FROM candidate WHERE jobs.id=candidate.id RETURNING `+JobColumns, leaseDuration))
 }
 
 // finish records the outcome of an attempt. A nil jobErr succeeds; a
 // TerminalError fails immediately; anything else retries with exponential
 // backoff until max_attempts. The UPDATE is fenced on attempts and a live
 // lease, so a stale worker's completion is rejected rather than applied.
-func (a App) finish(ctx context.Context, j Job, result []byte, jobErr error) error {
+func (q *Queue) Finish(ctx context.Context, j Job, result []byte, jobErr error) error {
 	state, event, failure := "succeeded", "succeeded", ""
 	delay := 1 << min(j.Attempts, 6)
 	if jobErr != nil {
 		failure = jobErr.Error()
 		switch {
-		case isTerminal(jobErr):
+		case IsTerminal(jobErr):
 			state, event = "failed", "failed_terminal"
 		case j.Attempts >= 3:
 			state, event = "failed", "failed"
@@ -197,7 +240,7 @@ func (a App) finish(ctx context.Context, j Job, result []byte, jobErr error) err
 			state, event = "queued", "retry"
 		}
 	}
-	tx, err := a.db.Begin(ctx)
+	tx, err := q.db.Begin(ctx)
 	if err != nil {
 		return err
 	}
@@ -223,7 +266,7 @@ func (a App) finish(ctx context.Context, j Job, result []byte, jobErr error) err
 // runOne executes a claimed job with its registered handler and records the
 // outcome. A job whose type has no handler in this binary is a terminal
 // failure: retrying would only reach the same binary.
-func (a App) runOne(ctx context.Context, reg *Registry, j Job) {
+func (q *Queue) RunOne(ctx context.Context, reg *Registry, j Job) {
 	slog.Info("job started", "job_id", j.ID, "type", j.Type, "attempt", j.Attempts)
 	var result []byte
 	var err error
@@ -237,20 +280,20 @@ func (a App) runOne(ctx context.Context, reg *Registry, j Job) {
 		// picks it up, rather than recording a spurious failure.
 		return
 	}
-	if ferr := a.finish(ctx, j, result, err); ferr != nil {
+	if ferr := q.Finish(ctx, j, result, err); ferr != nil {
 		slog.Error("completion", "job_id", j.ID, "error", ferr)
 		return
 	}
 	if err != nil {
-		slog.Warn("job failed", "job_id", j.ID, "attempt", j.Attempts, "terminal", isTerminal(err), "error", err)
+		slog.Warn("job failed", "job_id", j.ID, "attempt", j.Attempts, "terminal", IsTerminal(err), "error", err)
 	} else {
 		slog.Info("job completed", "job_id", j.ID, "attempt", j.Attempts)
 	}
 }
 
-func (a App) worker(ctx context.Context, reg *Registry) {
+func (q *Queue) Worker(ctx context.Context, reg *Registry) {
 	for ctx.Err() == nil {
-		j, err := a.claim(ctx)
+		j, err := q.Claim(ctx)
 		if err != nil {
 			if !errors.Is(err, pgx.ErrNoRows) && ctx.Err() == nil {
 				slog.Error("claim", "error", err)
@@ -262,6 +305,54 @@ func (a App) worker(ctx context.Context, reg *Registry) {
 			}
 			continue
 		}
-		a.runOne(ctx, reg, j)
+		q.RunOne(ctx, reg, j)
 	}
+}
+
+// List returns the most recent jobs, newest first.
+func (q *Queue) List(ctx context.Context, limit int) ([]Job, error) {
+	rows, err := q.db.Query(ctx, `SELECT `+JobColumns+` FROM jobs ORDER BY id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	jobs := []Job{}
+	for rows.Next() {
+		j, err := ScanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
+}
+
+// Get returns one job or pgx.ErrNoRows.
+func (q *Queue) Get(ctx context.Context, id int64) (Job, error) {
+	return ScanJob(q.db.QueryRow(ctx, `SELECT `+JobColumns+` FROM jobs WHERE id=$1`, id))
+}
+
+// Count is one row of Stats.
+type Count struct {
+	Type, State string
+	N           int
+}
+
+// Stats returns job counts by type and state plus the total retry count.
+// It is derived from durable state so it survives restarts.
+func (q *Queue) Stats(ctx context.Context) (counts []Count, retries int, err error) {
+	rows, err := q.db.Query(ctx, `SELECT type,state,count(*) FROM jobs GROUP BY type,state ORDER BY type,state`)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c Count
+		if err := rows.Scan(&c.Type, &c.State, &c.N); err != nil {
+			return nil, 0, err
+		}
+		counts = append(counts, c)
+	}
+	err = q.db.QueryRow(ctx, `SELECT count(*) FROM events WHERE event='retry'`).Scan(&retries)
+	return counts, retries, err
 }

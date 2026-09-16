@@ -1,0 +1,110 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"dispatch/internal/analyze"
+	"dispatch/internal/queue"
+)
+
+func TestHTTP(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("isolated test database required")
+	}
+	ctx := context.Background()
+	db, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	q := queue.New(db)
+	if err := q.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, "TRUNCATE events,job_dependencies,jobs RESTART IDENTITY"); err != nil {
+		t.Fatal(err)
+	}
+	reg := queue.NewRegistry()
+	reg.Register("analyze", analyze.Handler{})
+	t.Setenv("DEMO_MODE", "1")
+	h := (&Server{Q: q, Reg: reg, Token: "secret"}).Handler()
+	do := func(method, path, body, key string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer secret")
+		if key != "" {
+			r.Header.Set("Idempotency-Key", key)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	if w := do("GET", "/jobs", "", ""); w.Code != 200 {
+		t.Fatal("auth failed", w.Code)
+	}
+	r := httptest.NewRequest("GET", "/jobs", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 401 {
+		t.Fatal("missing token accepted")
+	}
+	r = httptest.NewRequest("GET", "/healthz", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatal("healthz should not need a token")
+	}
+
+	if w := do("POST", "/jobs", `{"payload":{"description":"Go PostgreSQL"}}`, "same"); w.Code != 202 {
+		t.Fatal(w.Body.String())
+	}
+	// Same input with explicit type and different key order is the same job.
+	if w := do("POST", "/jobs", `{"type":"analyze","payload":{"description":"Go PostgreSQL"}}`, "same"); w.Code != 202 {
+		t.Fatal(w.Body.String())
+	}
+	if w := do("POST", "/jobs", `{"payload":{"description":"Python"}}`, "same"); w.Code != 409 {
+		t.Fatal("key conflict not rejected")
+	}
+	if w := do("POST", "/jobs", `{"type":"nope","payload":{}}`, ""); w.Code != 400 || !strings.Contains(w.Body.String(), "known_types") {
+		t.Fatal("unknown type:", w.Body.String())
+	}
+	if w := do("POST", "/jobs", `{"payload":{"description":"x","demo_delay_seconds":99}}`, ""); w.Code != 400 {
+		t.Fatal("handler validation not applied:", w.Body.String())
+	}
+	if w := do("POST", "/jobs", `{"payload":{"description":"x"},"depends_on":[999]}`, ""); w.Code != 400 {
+		t.Fatal("unknown dependency:", w.Body.String())
+	}
+	w = do("POST", "/jobs", `{"payload":{"description":"x"},"depends_on":[1]}`, "child")
+	if w.Code != 202 {
+		t.Fatal(w.Body.String())
+	}
+	var created struct{ ID int64 }
+	json.Unmarshal(w.Body.Bytes(), &created)
+	w = do("GET", fmt.Sprintf("/jobs/%d", created.ID), "", "")
+	var got struct {
+		PendingDeps int `json:"pending_deps"`
+		DependsOn   []struct {
+			ID    int64  `json:"id"`
+			State string `json:"state"`
+		} `json:"depends_on"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &got)
+	if w.Code != 200 || got.PendingDeps != 1 || len(got.DependsOn) != 1 || got.DependsOn[0].ID != 1 || got.DependsOn[0].State != "queued" {
+		t.Fatalf("GET /jobs/{id} deps wrong: %s", w.Body.String())
+	}
+	if w := do("GET", "/jobs/abc", "", ""); w.Code != 404 {
+		t.Fatal("bad id")
+	}
+	if w := do("GET", "/metrics", "", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `dispatch_jobs{type="analyze",state="queued"} 2`) {
+		t.Fatal("metrics:", w.Body.String())
+	}
+}
