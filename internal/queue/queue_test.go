@@ -4,29 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"dispatch/internal/testdb"
 )
 
 // testDB connects to TEST_DATABASE_URL and resets the tables. Point it only
 // at a disposable database.
 func testDB(t *testing.T) (*Queue, context.Context) {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("isolated test database required")
-	}
 	ctx := context.Background()
-	db, err := pgxpool.New(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(db.Close)
+	db := testdb.Open(t, "queue")
 	q := New(db)
 	if err := q.Migrate(ctx); err != nil {
 		t.Fatal(err)

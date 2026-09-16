@@ -97,7 +97,7 @@ Local demo inputs `demo_delay_seconds` (0–30) and `demo_fail_attempts` (0–3)
 
 ## Tests
 
-`go test -race ./...` runs unit tests. Set TEST_DATABASE_URL to a dedicated disposable Postgres database to run integration tests; those tests TRUNCATE that database's jobs, events and job_dependencies tables. They cover concurrent claims, expired leases, stale-worker fencing, retries, terminal failure, successful completion, and submission deduplication.
+`go test -race ./...` runs unit tests. Set TEST_DATABASE_URL to a dedicated disposable Postgres database to run integration tests; each test package creates and uses its own database named after it (e.g. dispatch_test_queue), so the role needs CREATE DATABASE and packages can run in parallel. They cover concurrent claims, expired leases, stale-worker fencing, retries, terminal failure, successful completion, and submission deduplication.
 
 ## Deploy on Render
 

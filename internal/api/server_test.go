@@ -5,27 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"dispatch/internal/analyze"
 	"dispatch/internal/queue"
+	"dispatch/internal/testdb"
 )
 
 func TestHTTP(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("isolated test database required")
-	}
 	ctx := context.Background()
-	db, err := pgxpool.New(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := testdb.Open(t, "api")
 	q := queue.New(db)
 	if err := q.Migrate(ctx); err != nil {
 		t.Fatal(err)

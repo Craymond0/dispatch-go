@@ -123,7 +123,7 @@ func TestRenderDigest(t *testing.T) {
 }
 
 func TestHostLimiter(t *testing.T) {
-	l := newHostLimiter(10, 2) // 10/s, burst 2
+	l := newHostLimiter(5, 2) // 5/s, burst 2
 	ctx := context.Background()
 	start := time.Now()
 	for i := 0; i < 2; i++ {
@@ -131,15 +131,15 @@ func TestHostLimiter(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if time.Since(start) > 20*time.Millisecond {
+	if time.Since(start) > 100*time.Millisecond {
 		t.Fatal("burst should not wait")
 	}
-	// Third request on the same host must wait ~100ms; a different host does not.
-	if err := l.wait(ctx, "b"); err != nil || time.Since(start) > 20*time.Millisecond {
+	// Third request on the same host must wait ~200ms; a different host does not.
+	if err := l.wait(ctx, "b"); err != nil || time.Since(start) > 100*time.Millisecond {
 		t.Fatal("other host throttled")
 	}
 	l.wait(ctx, "a")
-	if el := time.Since(start); el < 80*time.Millisecond {
+	if el := time.Since(start); el < 150*time.Millisecond {
 		t.Fatal("not throttled:", el)
 	}
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)

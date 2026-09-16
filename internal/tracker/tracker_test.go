@@ -6,27 +6,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"sync/atomic"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"dispatch/internal/queue"
+	"dispatch/internal/testdb"
 )
 
 func setup(t *testing.T) (*Tracker, *queue.Registry, context.Context) {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("isolated test database required")
-	}
 	ctx := context.Background()
-	db, err := pgxpool.New(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(db.Close)
+	db := testdb.Open(t, "tracker")
 	q := queue.New(db)
 	if err := q.Migrate(ctx); err != nil {
 		t.Fatal(err)
