@@ -1,8 +1,8 @@
 # Dispatch
 
-[![ci](https://github.com/Craymond0/dispatch-go/actions/workflows/ci.yml/badge.svg)](https://github.com/Craymond0/dispatch-go/actions/workflows/ci.yml)
+A Go/PostgreSQL job queue with leases, fencing, retries, idempotency and a dependency graph, and an application tracker built on it that watches job boards and records applications. The tracker is the real workload; the queue is the engine under it.
 
-A Go/PostgreSQL background-job service for analyzing saved job descriptions. This is an API project, not yet a full application tracker or browser dashboard.
+[![ci](https://github.com/Craymond0/dispatch-go/actions/workflows/ci.yml/badge.svg)](https://github.com/Craymond0/dispatch-go/actions/workflows/ci.yml)
 
 ## Run locally
 
@@ -26,6 +26,7 @@ cmd/dispatch/       the binary: API by default, worker with ROLE=worker
 internal/queue/     the engine: schema, claim/finish, dependencies, handler registry
 internal/analyze/   the demo handler (term matching)
 internal/api/       HTTP surface over the queue
+internal/tracker/   the application tracker: sources, job handlers, its own tables and routes
 ```
 
 ## Handlers
@@ -33,6 +34,38 @@ internal/api/       HTTP surface over the queue
 Work is pluggable. A handler implements `Validate(payload)` and `Run(ctx, job)` and is registered by name in `newRegistry()`. The worker looks up the handler by the job's `type`; a job whose type has no handler in the running binary fails terminally rather than retrying against the same binary forever.
 
 `analyze` is the built-in demo handler: it finds a fixed list of technology terms in a text in a single pass (see `matchTerms`).
+
+## Tracker
+
+The tracker turns the queue into something used daily. Every few hours a `sweep` job fans out into:
+
+- `feed.poll`: the SimplifyJobs New-Grad-Positions listing (one 13 MB JSON file, fetched with `If-None-Match` so an unchanged feed costs a 304). About 3,000 active postings across 1,100 companies.
+- `board.poll` per followed company: its Greenhouse, Lever or Ashby public board API, fresher than the feed.
+- `posting.recheck` per tracked posting: does the URL still exist. A 404 here is a *result* (closed), not a failure.
+
+and a `digest` that depends on all of them. The digest runs when every child has finished, whether or not it succeeded, and reports what changed since the last digest plus which sources failed. A fan-in that waited forever on one dead board would hide the problem; one that runs can name it.
+
+Child jobs use idempotency keys derived from the sweep's own job id, so a sweep retried after a partial failure re-finds its children instead of duplicating them.
+
+Each source reconciles against what is stored: new postings are recorded, changed ones updated, and postings a source no longer lists are closed. A failed poll closes nothing: absence of evidence is not evidence of absence.
+
+Routes (all under the API token):
+
+```
+GET    /tracker/postings?state=open&tracked=1&category=Software&q=backend
+POST   /tracker/postings            {url, title, company}       paste a posting; tracked immediately
+PATCH  /tracker/postings/{id}       {tracked}
+GET    /tracker/companies?followed=1
+POST   /tracker/companies           {name, board_url}           follow a Greenhouse/Lever/Ashby board; polled right away
+PATCH  /tracker/companies/{id}      {followed}
+GET    /tracker/applications
+POST   /tracker/applications        {posting_id, applied_on, resume_ref, notes}
+PATCH  /tracker/applications/{id}   {status, last_contact_on, notes, resume_ref}
+GET    /tracker/digest              latest digest
+POST   /tracker/sweep               run a sweep now
+```
+
+Not covered: LinkedIn, Indeed and other sites that prohibit automated access. Companies that use Workday or a custom careers site come in through the feed or by pasting a URL, and are rechecked by status code only.
 
 ## Dependencies
 

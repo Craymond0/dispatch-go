@@ -18,6 +18,8 @@ type Server struct {
 	Q     *queue.Queue
 	Reg   *queue.Registry
 	Token string
+	// Mount lets other packages add routes under the same auth.
+	Mount func(*http.ServeMux)
 }
 
 func write(w http.ResponseWriter, status int, v any) {
@@ -41,6 +43,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /jobs/{id}", s.get)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("GET /healthz", s.healthz)
+	if s.Mount != nil {
+		s.Mount(mux)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/healthz" && s.Token != "" && r.Header.Get("Authorization") != "Bearer "+s.Token {
 			http.Error(w, "unauthorized", 401)
