@@ -137,12 +137,12 @@ func TestFitStream(t *testing.T) {
 		t.Fatal("force did not regenerate")
 	}
 	do("PUT", "/tracker/resume", `{"text":`+jsonStr(resume+" updated")+`}`)
-	if w := do("GET", fit, ""); w.Code != 404 {
-		t.Fatal("resume change should invalidate reports")
+	if w := do("GET", fit, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"report":null`) {
+		t.Fatal("resume change should invalidate reports:", w.Body.String())
 	}
 	do("POST", fit, "")
 	do("PUT", fmt.Sprintf("/tracker/postings/%d/description", pid), `{"text":"`+strings.Repeat("Pasted JD text with Kafka. ", 20)+`"}`)
-	if w := do("GET", fit, ""); w.Code != 404 {
+	if w := do("GET", fit, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"report":null`) {
 		t.Fatal("description change should invalidate the report")
 	}
 

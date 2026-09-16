@@ -194,10 +194,12 @@ func (t *Tracker) fitGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rep, ok := t.getFit(r.Context(), id); ok {
-		write(w, 200, rep)
+		write(w, 200, map[string]any{"report": rep})
 		return
 	}
-	write(w, 404, map[string]string{"error": "no report yet"})
+	// 200 with a null report, not 404: "no report yet" is the normal state for
+	// most postings and should not look like an error in the browser console.
+	write(w, 200, map[string]any{"report": nil})
 }
 
 // fitStream streams a fit analysis as server-sent events:

@@ -4,6 +4,10 @@ A Go/PostgreSQL job queue with leases, fencing, retries, idempotency and a depen
 
 [![ci](https://github.com/Craymond0/dispatch-go/actions/workflows/ci.yml/badge.svg)](https://github.com/Craymond0/dispatch-go/actions/workflows/ci.yml)
 
+![Queue](docs/queue.png)
+
+The queue view above is a real run: two sweeps, a feed poll that returned 304 on the second pass, and a posting recheck that exhausted its three attempts against an unreachable host. One sweep ingested **3,071 live postings across 1,149 companies** from the SimplifyJobs feed.
+
 ## Run locally
 
 Install/start Docker Desktop, then run `docker compose -p raymond-dispatch up --build -d --scale worker=2` in this folder.
@@ -19,6 +23,29 @@ curl -X POST http://localhost:8088/jobs -H 'Content-Type: application/json' -H '
   -d '{"type":"analyze","payload":{"company":"Example","title":"Software Engineer","description":"Go, Python, PostgreSQL, Docker and Linux"}}'
 ```
 
+## Dashboard
+
+React + TypeScript, built with Vite and embedded into the Go binary, so a deploy is one file with no separate static host. Sign in with `DASHBOARD_PASSWORD`.
+
+| | |
+|---|---|
+| ![Digest](docs/digest.png) | ![Postings](docs/postings.png) |
+| Digest: what changed since last sweep | Postings: filter 3,000+ live listings |
+
+![Posting detail](docs/posting-detail.png)
+
+Opening a posting gives its details, a one-click application record, and the fit analysis.
+
+Development: `npm --prefix web install && npm --prefix web run dev` proxies the API to `localhost:8088`. `npm --prefix web run build` writes into `internal/web/dist`, which `go build` embeds.
+
+## Fit analysis
+
+`POST /tracker/postings/{id}/fit` streams an assessment of how your stored master resume matches a posting, as server-sent events rendered token by token in the dashboard.
+
+The system prompt is a grounding contract rather than a request for an opinion: the resume is the only source of truth about the candidate, every claimed match must quote the resume fragment that supports it, and anything the posting asks for that the resume does not show is reported as a gap rather than glossed. The posting text is extracted from its page on first use; pages rendered entirely by JavaScript fail with a 422 that asks you to paste the description instead, rather than sending the model an empty page.
+
+Reports are cached per posting and invalidated whenever the resume or the description changes, since they were grounded in the previous text. Needs `ANTHROPIC_API_KEY`; without it the endpoint returns a clear 503 and nothing else breaks.
+
 ## Layout
 
 ```
@@ -27,7 +54,26 @@ internal/queue/     the engine: schema, claim/finish, dependencies, handler regi
 internal/analyze/   the demo handler (term matching)
 internal/api/       HTTP surface over the queue
 internal/tracker/   the application tracker: sources, job handlers, its own tables and routes
+internal/llm/       streaming Anthropic Messages client (no SDK dependency)
+internal/web/       embeds the built dashboard
+internal/testdb/    per-package throwaway databases for tests
+web/                React + TypeScript dashboard (Vite)
 ```
+
+## Configuration
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Postgres connection string |
+| `ROLE` | `api` (default) or `worker` |
+| `API_TOKEN` | Bearer token for the API; required unless `DEMO_MODE=1` |
+| `DASHBOARD_PASSWORD` | Enables the dashboard cookie login |
+| `SESSION_SECRET` | Signs session cookies; derived from `API_TOKEN` if unset |
+| `ANTHROPIC_API_KEY` | Enables fit analysis |
+| `ANTHROPIC_MODEL` | Defaults to `claude-sonnet-5` |
+| `RESEND_API_KEY`, `DIGEST_FROM`, `DIGEST_TO` | Email digests; all three or none |
+| `SWEEP_INTERVAL` | Default `6h` |
+| `FEED_URL` | Override the job feed (tests, mirrors) |
 
 ## Handlers
 
