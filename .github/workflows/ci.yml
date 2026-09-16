@@ -20,7 +20,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -34,7 +34,7 @@ jobs:
   web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -63,8 +63,8 @@ jobs:
           --health-timeout 3s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t dispatch:ci .
+      - uses: actions/checkout@v5
+      - run: DOCKER_BUILDKIT=1 docker build --progress=plain -t dispatch:ci .
       - name: image serves the API and the embedded dashboard
         run: |
           set -euo pipefail
