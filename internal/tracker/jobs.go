@@ -184,7 +184,7 @@ func (h postingRecheck) Run(ctx context.Context, j queue.Job) ([]byte, error) {
 		return nil, queue.Terminal(err)
 	}
 	req.Header.Set("User-Agent", "dispatch-tracker/1 (+https://github.com/Craymond0/dispatch-go)")
-	resp, err := t.HTTP.Do(req)
+	resp, err := t.do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -366,11 +366,19 @@ func (h digest) Run(ctx context.Context, j queue.Job) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := t.db().Exec(ctx, `INSERT INTO tracker_events(kind,detail) VALUES('digest',$1)`, out); err != nil {
+	var eventID int64
+	if err := t.db().QueryRow(ctx, `INSERT INTO tracker_events(kind,detail) VALUES('digest',$1) RETURNING id`, out).Scan(&eventID); err != nil {
 		return nil, err
 	}
 	if err := t.setState(ctx, "digest.last_at", d.At.Format(time.RFC3339Nano)); err != nil {
 		return nil, err
+	}
+	// Only email when there is something to say. The key ties the email to
+	// this digest event so a retried digest job cannot queue a second copy.
+	if len(d.New)+len(d.Closed)+len(d.Changed)+len(d.FollowUps)+len(d.FailedSources) > 0 {
+		if _, _, err := t.Q.Enqueue(ctx, queue.EnqueueRequest{Type: "notify.email", Payload: []byte(fmt.Sprintf(`{"digest_event_id":%d}`, eventID)), Key: fmt.Sprintf("notify.email:digest:%d", eventID)}); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }

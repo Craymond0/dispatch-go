@@ -138,9 +138,9 @@ func TestSweepEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	ran := drain(t, tr, reg, ctx)
-	// sweep + feed + 1 board + digest
-	if ran != 4 {
-		t.Fatalf("ran %d jobs, want 4", ran)
+	// sweep + feed + 1 board + digest + notify (skipped: email off)
+	if ran != 5 {
+		t.Fatalf("ran %d jobs, want 5", ran)
 	}
 	var sweepResult struct {
 		Children int   `json:"children"`

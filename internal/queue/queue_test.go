@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -259,5 +260,74 @@ func TestDependencies(t *testing.T) {
 	q.db.QueryRow(ctx, "SELECT count(*) FROM job_dependencies WHERE job_id=$1", d).Scan(&edges)
 	if _, _, p := state(t, q, ctx, d); edges != 3 || p != 0 {
 		t.Fatalf("resubmit corrupted deps: edges=%d pending=%d", edges, p)
+	}
+}
+
+func TestSchedules(t *testing.T) {
+	q, ctx := testDB(t)
+	q.db.Exec(ctx, "DELETE FROM schedules")
+	if err := q.EnsureSchedule(ctx, Schedule{Name: "tick", Type: "stub", Interval: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	// Due immediately on creation.
+	n, err := q.RunDue(ctx)
+	if err != nil || n != 1 {
+		t.Fatal("first run", n, err)
+	}
+	// Not due again yet, and idempotent across repeated ticks.
+	if n, _ := q.RunDue(ctx); n != 0 {
+		t.Fatal("fired twice in one interval")
+	}
+	ss, _ := q.Schedules(ctx)
+	if len(ss) != 1 || ss[0].LastJobID == nil || !ss[0].NextAt.After(time.Now()) {
+		t.Fatalf("schedule not advanced: %+v", ss)
+	}
+	// After a long outage, only one job is created (no catch-up storm) and next_at lands in the future.
+	q.db.Exec(ctx, "UPDATE schedules SET next_at=now()-interval '10 minutes'")
+	if n, _ := q.RunDue(ctx); n != 1 {
+		t.Fatal("missed slots should fire once, got", n)
+	}
+	var jobs int
+	q.db.QueryRow(ctx, "SELECT count(*) FROM jobs WHERE idempotency_key LIKE 'schedule:tick:%'").Scan(&jobs)
+	if jobs != 2 {
+		t.Fatal("jobs:", jobs)
+	}
+	ss, _ = q.Schedules(ctx)
+	if !ss[0].NextAt.After(time.Now()) {
+		t.Fatal("next_at still in the past after catch-up")
+	}
+	// EnsureSchedule on restart keeps next_at (no reset), and a shorter interval pulls it in.
+	before := ss[0].NextAt
+	q.EnsureSchedule(ctx, Schedule{Name: "tick", Type: "stub", Interval: time.Minute})
+	ss, _ = q.Schedules(ctx)
+	if !ss[0].NextAt.Equal(before) {
+		t.Fatal("restart reset next_at")
+	}
+	q.db.Exec(ctx, "UPDATE schedules SET next_at=now()+interval '1 hour'")
+	q.EnsureSchedule(ctx, Schedule{Name: "tick", Type: "stub", Interval: 2 * time.Minute})
+	ss, _ = q.Schedules(ctx)
+	if ss[0].NextAt.After(time.Now().Add(3 * time.Minute)) {
+		t.Fatal("shorter interval did not pull next_at in")
+	}
+	// Two concurrent tickers: exactly one enqueues per due slot.
+	q.db.Exec(ctx, "UPDATE schedules SET next_at=now()")
+	var wg sync.WaitGroup
+	total := make(chan int, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n, _ := q.RunDue(ctx)
+			total <- n
+		}()
+	}
+	wg.Wait()
+	close(total)
+	sum := 0
+	for n := range total {
+		sum += n
+	}
+	if sum != 1 {
+		t.Fatal("concurrent tickers enqueued", sum)
 	}
 }

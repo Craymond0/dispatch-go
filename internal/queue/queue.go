@@ -23,7 +23,7 @@ const schema = `CREATE TABLE IF NOT EXISTS jobs (
  CREATE INDEX IF NOT EXISTS jobs_claim ON jobs(state,available_at);
  CREATE TABLE IF NOT EXISTS events (id BIGSERIAL PRIMARY KEY,job_id BIGINT REFERENCES jobs(id),attempt INT,event TEXT,at TIMESTAMPTZ DEFAULT now());
  CREATE TABLE IF NOT EXISTS job_dependencies (job_id BIGINT NOT NULL REFERENCES jobs(id), depends_on BIGINT NOT NULL REFERENCES jobs(id), PRIMARY KEY(job_id,depends_on));
- CREATE INDEX IF NOT EXISTS job_dependencies_depends_on ON job_dependencies(depends_on);`
+ CREATE INDEX IF NOT EXISTS job_dependencies_depends_on ON job_dependencies(depends_on);` + scheduleSchema
 
 // releaseDependents decrements pending_deps on every job that was waiting on
 // one of the given jobs. It is called whenever a job reaches a terminal state

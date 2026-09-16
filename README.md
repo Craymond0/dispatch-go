@@ -45,6 +45,12 @@ The tracker turns the queue into something used daily. Every few hours a `sweep`
 
 and a `digest` that depends on all of them. The digest runs when every child has finished, whether or not it succeeded, and reports what changed since the last digest plus which sources failed. A fan-in that waited forever on one dead board would hide the problem; one that runs can name it.
 
+The sweep runs on a schedule (`SWEEP_INTERVAL`, default 6h). Every worker ticks the scheduler, but on each tick exactly one wins a transaction-scoped advisory lock and enqueues whatever is due, so there is no long-lived leader to fail over and no duplicate sweeps. After an outage the schedule fires once and advances to the next future slot rather than replaying every missed interval.
+
+Outbound requests go through a per-host token bucket (2 req/s, burst 4), so a sweep that fans out into fifty board polls cannot hammer one API.
+
+When a digest has anything to report it queues a `notify.email` job. With `RESEND_API_KEY`, `DIGEST_FROM` and `DIGEST_TO` set it sends through Resend, passing the same idempotency key to the provider so a retried send cannot deliver twice; unset, the job succeeds as skipped so a missing key never poisons a sweep.
+
 Child jobs use idempotency keys derived from the sweep's own job id, so a sweep retried after a partial failure re-finds its children instead of duplicating them.
 
 Each source reconciles against what is stored: new postings are recorded, changed ones updated, and postings a source no longer lists are closed. A failed poll closes nothing: absence of evidence is not evidence of absence.
@@ -62,6 +68,7 @@ GET    /tracker/applications
 POST   /tracker/applications        {posting_id, applied_on, resume_ref, notes}
 PATCH  /tracker/applications/{id}   {status, last_contact_on, notes, resume_ref}
 GET    /tracker/digest              latest digest
+GET    /tracker/status              counts, next sweep, last digest
 POST   /tracker/sweep               run a sweep now
 ```
 

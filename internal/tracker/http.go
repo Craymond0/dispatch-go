@@ -50,6 +50,33 @@ func (t *Tracker) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /tracker/applications/{id}", t.patchApplication)
 	mux.HandleFunc("GET /tracker/digest", t.latestDigest)
 	mux.HandleFunc("POST /tracker/sweep", t.startSweep)
+	mux.HandleFunc("GET /tracker/status", t.status)
+}
+
+// status is the one call a dashboard makes on load.
+func (t *Tracker) status(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	out := map[string]any{"email_configured": t.Email.configured()}
+	var open, tracked, followed, apps int
+	t.db().QueryRow(ctx, `SELECT count(*) FILTER (WHERE state='open'), count(*) FILTER (WHERE tracked AND state='open') FROM postings`).Scan(&open, &tracked)
+	t.db().QueryRow(ctx, `SELECT count(*) FROM companies WHERE followed`).Scan(&followed)
+	t.db().QueryRow(ctx, `SELECT count(*) FROM applications WHERE status IN ('applied','oa','phone','onsite')`).Scan(&apps)
+	out["open_postings"], out["tracked_postings"], out["followed_companies"], out["active_applications"] = open, tracked, followed, apps
+	if s := t.getState(ctx, "digest.last_at"); s != "" {
+		out["last_digest_at"] = s
+	}
+	if ss, err := t.Q.Schedules(ctx); err == nil {
+		for _, s := range ss {
+			if s.Name == "sweep" {
+				out["next_sweep_at"] = s.NextAt
+				out["sweep_interval_seconds"] = int(s.Interval.Seconds())
+			}
+		}
+	}
+	var running, queued int
+	t.db().QueryRow(ctx, `SELECT count(*) FILTER (WHERE state='running'), count(*) FILTER (WHERE state='queued') FROM jobs`).Scan(&running, &queued)
+	out["jobs_running"], out["jobs_queued"] = running, queued
+	write(w, 200, out)
 }
 
 // --- postings ----------------------------------------------------------------

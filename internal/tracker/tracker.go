@@ -83,6 +83,13 @@ type Tracker struct {
 	GreenhouseBase string
 	LeverBase      string
 	AshbyBase      string
+
+	// Email is digest delivery; zero value means off.
+	Email Email
+	// SweepInterval is how often the scheduled sweep runs.
+	SweepInterval time.Duration
+
+	limiter *hostLimiter
 }
 
 // Defaults returns a Tracker configured for the real services.
@@ -94,7 +101,18 @@ func Defaults(q *queue.Queue) *Tracker {
 		GreenhouseBase: "https://boards-api.greenhouse.io/v1/boards/",
 		LeverBase:      "https://api.lever.co/v0/postings/",
 		AshbyBase:      "https://api.ashbyhq.com/posting-api/job-board/",
+		SweepInterval:  6 * time.Hour,
+		limiter:        newHostLimiter(2, 4), // 2 req/s per host, burst 4
 	}
+}
+
+// Start registers the recurring sweep. Call it once at startup from any
+// role; it is idempotent and preserves the existing cadence.
+func (t *Tracker) Start(ctx context.Context) error {
+	if t.SweepInterval <= 0 {
+		return nil
+	}
+	return t.Q.EnsureSchedule(ctx, queue.Schedule{Name: "sweep", Type: "sweep", Interval: t.SweepInterval})
 }
 
 func (t *Tracker) db() *pgxpool.Pool { return t.Q.DB() }
@@ -106,6 +124,7 @@ func (t *Tracker) Register(reg *queue.Registry) {
 	reg.Register("posting.recheck", postingRecheck{t})
 	reg.Register("sweep", sweep{t})
 	reg.Register("digest", digest{t})
+	reg.Register("notify.email", notifyEmail{t})
 }
 
 // --- domain types --------------------------------------------------------
@@ -283,7 +302,7 @@ func (t *Tracker) getJSON(ctx context.Context, url string, etag string, v any) (
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
 	}
-	resp, err := t.HTTP.Do(req)
+	resp, err := t.do(req)
 	if err != nil {
 		return "", false, err
 	}
