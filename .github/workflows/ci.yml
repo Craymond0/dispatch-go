@@ -43,3 +43,52 @@ jobs:
       - run: npm --prefix web ci
       - run: npm --prefix web run typecheck
       - run: npm --prefix web run build
+
+  # Builds the image exactly as a deploy would, then runs it against a real
+  # Postgres and checks the API, the embedded dashboard and the worker role.
+  # A broken Dockerfile fails here instead of at deploy time.
+  docker:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: dispatch
+          POSTGRES_PASSWORD: dispatch
+          POSTGRES_DB: dispatch
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U dispatch"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t dispatch:ci .
+      - name: image serves the API and the embedded dashboard
+        run: |
+          set -euo pipefail
+          # --network host so the container reaches the Postgres service on
+          # localhost without assuming the docker bridge gateway address.
+          DB='postgres://dispatch:dispatch@localhost:5432/dispatch?sslmode=disable'
+          docker run -d --name api --network host -e DATABASE_URL="$DB" \
+            -e API_TOKEN=ci-token -e DASHBOARD_PASSWORD=ci-pass dispatch:ci
+          for i in $(seq 1 30); do
+            curl -fsS localhost:8080/healthz && break || sleep 1
+          done
+          curl -fsS localhost:8080/healthz | grep -q '"status":"ok"'
+          # The dashboard is embedded, not a "not built" placeholder.
+          curl -fsS localhost:8080/ | grep -q '<div id="root">'
+          # Unauthenticated API access is refused; the token works.
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/jobs)" = 401
+          curl -fsS -H 'Authorization: Bearer ci-token' localhost:8080/tracker/status | grep -q open_postings
+          docker logs api | tail -5
+          docker rm -f api
+      - name: worker role starts from argv
+        run: |
+          set -euo pipefail
+          DB='postgres://dispatch:dispatch@localhost:5432/dispatch?sslmode=disable'
+          docker run -d --name worker --network host -e DATABASE_URL="$DB" dispatch:ci worker
+          sleep 5
+          docker logs worker 2>&1 | grep -q '"msg":"worker started"'
+          docker rm -f worker

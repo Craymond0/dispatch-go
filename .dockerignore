@@ -1,3 +1,9 @@
 .git
+.github
 .env
 *.log
+docs
+web/node_modules
+# The image builds the dashboard itself in the web stage; a stale local build
+# would otherwise be copied in and then overwritten.
+internal/web/dist

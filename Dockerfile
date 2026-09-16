@@ -5,8 +5,8 @@ WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
-COPY internal/web/dist/.gitkeep /internal/web/dist/.gitkeep
-RUN npm run build && ls -la /internal/web/dist
+# vite.config.ts writes to ../internal/web/dist, i.e. /internal/web/dist here.
+RUN mkdir -p /internal/web/dist && npm run build && ls -l /internal/web/dist
 
 FROM golang:1.24-bookworm AS build
 WORKDIR /src
