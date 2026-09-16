@@ -1,7 +1,10 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// The build lands inside the Go module so `go build` embeds it.
+// The build lands inside the Go module so `go build` embeds it. emptyOutDir
+// wipes the directory, including the committed .gitkeep that keeps
+// //go:embed compiling on a clone that has never run this build, so the
+// build script recreates it afterwards.
 export default defineConfig({
   plugins: [react()],
   build: { outDir: '../internal/web/dist', emptyOutDir: true },

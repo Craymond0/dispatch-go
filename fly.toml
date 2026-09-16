@@ -1,0 +1,50 @@
+# Fly.io deployment. One image, two process groups: "app" serves the API and
+# dashboard, "worker" runs the queue worker and the scheduler. Both read the
+# same Postgres; Neon's free tier carries this workload.
+#
+#   fly launch --no-deploy --copy-config
+#   fly secrets set DATABASE_URL=... API_TOKEN=... SESSION_SECRET=... \
+#                   DASHBOARD_PASSWORD=... ANTHROPIC_API_KEY=...
+#   fly deploy
+#   fly scale count app=1 worker=1 --vm-size shared-cpu-1x --vm-memory 256
+#
+# The API suspends when idle and wakes on request. The worker stays up, since
+# it owns the scheduler that fires the recurring sweep.
+app = "dispatch-go"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  SWEEP_INTERVAL = "6h"
+
+# Both process groups run the same image; the argument selects the role.
+[processes]
+  app = "api"
+  worker = "worker"
+
+[[services]]
+  processes = ["app"]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.http_checks]
+    path = "/healthz"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+

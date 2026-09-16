@@ -33,7 +33,10 @@ const schema = `CREATE TABLE IF NOT EXISTS jobs (
 // inspect their dependencies with Queue.Dependencies.
 const releaseDependents = `UPDATE jobs SET pending_deps=pending_deps-1 WHERE id IN (SELECT job_id FROM job_dependencies WHERE depends_on = ANY($1::bigint[]))`
 
-const leaseDuration = 45 * time.Second
+// leaseDuration is how long a claim is held before another worker may take
+// the job. It is a var rather than a const only so the chaos test can shorten
+// it; nothing changes it at runtime.
+var leaseDuration = 45 * time.Second
 
 type Job struct {
 	ID          int64           `json:"id"`

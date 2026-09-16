@@ -46,10 +46,28 @@ The system prompt is a grounding contract rather than a request for an opinion: 
 
 Reports are cached per posting and invalidated whenever the resume or the description changes, since they were grounded in the previous text. Needs `ANTHROPIC_API_KEY`; without it the endpoint returns a clear 503 and nothing else breaks.
 
+## CLI
+
+`dispatchctl` is a small client over the same API, useful for operating the tracker without a browser.
+
+```sh
+go install ./cmd/dispatchctl
+export DISPATCH_URL=https://dispatch.example.com DISPATCH_TOKEN=...
+
+dispatchctl status
+dispatchctl sweep && dispatchctl watch     # kick off a sweep, poll until idle
+dispatchctl jobs --state failed
+dispatchctl postings --q "new grad" --limit 20
+dispatchctl follow https://jobs.lever.co/ramp
+dispatchctl track https://careers.example.com/jobs/1 Example "New Grad SWE"
+dispatchctl fit 42                          # streams the analysis to stdout
+```
+
 ## Layout
 
 ```
-cmd/dispatch/       the binary: API by default, worker with ROLE=worker
+cmd/dispatch/       the binary: API by default, worker with ROLE=worker or `dispatch worker`
+cmd/dispatchctl/    CLI client
 internal/queue/     the engine: schema, claim/finish, dependencies, handler registry
 internal/analyze/   the demo handler (term matching)
 internal/api/       HTTP surface over the queue
@@ -132,33 +150,61 @@ The analyzer uses a small literal technology dictionary. It does not score candi
 
 - PostgreSQL persists payloads, results, retry state and completion events.
 - Atomic claims use row locks and SKIP LOCKED across independent workers.
-- 45-second leases reclaim abandoned work after a crash. The current workload is bounded to 30 seconds; there is no lease renewal for arbitrary long-running jobs.
+- 45-second leases reclaim abandoned work after a crash. There is no lease renewal, so a handler that runs longer than the lease will have its job reassigned under it; every current handler finishes well inside it.
 - Attempt numbers fence stale workers from committing results after reassignment.
 - Failures retry with exponential delays up to three attempts, then remain visible as failed jobs. A handler can return `Terminal(err)` for failures that retrying cannot fix (malformed input, a permanent 404); those fail on the spot with a `failed_terminal` event and no further attempts.
 - Idempotency keys deduplicate submissions and reject a different type or payload using the same key. Without a key, one is derived from the type and the canonicalised payload, so key order in the JSON does not matter.
 - Delivery is at least once. Database result writes are fenced; external side effects would need their own idempotency design.
 - Structured JSON logs include job ID and attempt. Prometheus metrics are durable database-derived state and retry counts. Distributed tracing and a Grafana dashboard are future work.
 
-Local demo inputs `demo_delay_seconds` (0–30) and `demo_fail_attempts` (0–3) let you exercise failure paths. These inputs are rejected on Render unless DEMO_MODE is explicitly enabled. Never expose the unauthenticated local-demo configuration publicly.
+The `analyze` handler accepts `demo_delay_seconds` (0–30) and `demo_fail_attempts` (0–3) to exercise the delay and retry paths by hand. Both are rejected unless `DEMO_MODE=1`, which also disables the API token requirement, so never set it on a public deployment.
 
 ## Tests
 
-`go test -race ./...` runs unit tests. Set TEST_DATABASE_URL to a dedicated disposable Postgres database to run integration tests; each test package creates and uses its own database named after it (e.g. dispatch_test_queue), so the role needs CREATE DATABASE and packages can run in parallel. They cover concurrent claims, expired leases, stale-worker fencing, retries, terminal failure, successful completion, and submission deduplication.
+```sh
+createdb dispatch_test
+TEST_DATABASE_URL='postgres://…/dispatch_test?sslmode=disable' go test -race ./...
+npm --prefix web run typecheck
+```
 
-## Deploy on Render
+Each test package creates its own database named after it (`dispatch_test_queue`, `dispatch_test_tracker`, …), so `go test ./...` can run packages in parallel without them truncating each other's tables. The role needs `CREATE DATABASE`. Without `TEST_DATABASE_URL` the integration tests skip and the pure-Go ones still run.
 
-1. Publish the contents of this folder as a new GitHub repository named dispatch-go. Do not nest the files inside another directory.
-2. In Render select New > Blueprint, select that repository, and use render.yaml.
-3. The blueprint requests a paid web service, paid worker, and paid PostgreSQL database. Review the current combined price before Apply. No paid resources have been created for you.
-4. Wait for all three resources to be healthy. Open the API service URL with /healthz appended; it should return {"status":"ok"}.
-5. In the API service's Environment page, reveal API_TOKEN locally. Keep it private. Send `Authorization: Bearer YOUR_TOKEN` with API requests (except /healthz). Do not paste the token into chat or commit it.
-6. Submit POST /jobs with a JSON description, then GET /jobs/{id}; state should become succeeded and result should contain technical_terms.
+External services are never contacted: the tracker tests drive `httptest` servers that impersonate the feed, Greenhouse, a posting page, Resend and the Anthropic API, including their failure modes.
 
-The local Prometheus container is not hosted by this blueprint. For hosted collection, configure a Prometheus instance to scrape the API's /metrics path with bearer authentication. The endpoint and structured Render logs work without that extra service. Scale the worker to two instances in Render only if you accept the additional charge.
+### The chaos test
+
+`TestChaosNoLostOrDuplicatedWork` is the one worth reading. Eight workers race for 120 jobs, and about a third of the time a worker abandons its in-flight job without reporting, which is what SIGKILL, an OOM kill or a severed connection look like to the database. Its lease then lapses and another worker takes the job.
+
+It asserts four things, and the fourth is the point:
+
+1. Every job ends `succeeded` — nothing was lost.
+2. No job recorded two `succeeded` events — nothing ran to completion twice.
+3. Every job holds exactly one result.
+4. At least one stale completion was actually fenced out. A run where the race never happened would pass the first three trivially and prove nothing, so the test fails if the scenario it claims to exercise did not occur.
+
+## Deploy
+
+One image, two process groups, both reading the same Postgres. Fly.io and Neon's free tiers carry this workload; the older `render.yaml` provisions three paid resources and is kept only for reference.
+
+```sh
+fly launch --no-deploy --copy-config
+fly secrets set DATABASE_URL='postgres://…neon.tech/dispatch?sslmode=require' \
+                API_TOKEN="$(openssl rand -hex 32)" \
+                SESSION_SECRET="$(openssl rand -hex 32)" \
+                DASHBOARD_PASSWORD='…' \
+                ANTHROPIC_API_KEY='…'
+fly deploy
+fly scale count app=1 worker=1 --vm-size shared-cpu-1x --vm-memory 256
+curl https://<app>.fly.dev/healthz
+```
+
+The API machine suspends when idle and wakes on request; the worker stays up for the scheduler. Prometheus is not hosted: point any scraper at `/metrics` with the bearer token.
 
 ## Scope
 
-This version has no cancellation, user accounts, priority scheduler, arbitrary code execution, or browser dashboard. Next steps are request-duration metrics, richer telemetry, versioned migrations, pagination, retention, and an authenticated application-tracker frontend. No benchmark claims should be added to a resume before measurement.
+No cancellation, user accounts, priority scheduling, or arbitrary code execution. Migrations run from one embedded schema string under an advisory lock rather than a versioned migration tool, which is fine at this size and would not be at a larger one. Rechecks on Workday and similar sites are status-code only, so a posting that returns 200 for a dead role still reads as open.
+
+No throughput or latency figures are published here, because none have been measured under a realistic load. The chaos test establishes correctness under failure, not performance.
 
 ## How this was built
 
