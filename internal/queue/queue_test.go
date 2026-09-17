@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -320,5 +322,115 @@ func TestSchedules(t *testing.T) {
 	}
 	if sum != 1 {
 		t.Fatal("concurrent tickers enqueued", sum)
+	}
+}
+
+// runWorker starts a worker in the background and returns a stop function.
+func runWorker(t *testing.T, q *Queue, reg *Registry, opts WorkerOptions) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); q.Worker(ctx, reg, opts) }()
+	stopped := false
+	return func() {
+		if stopped {
+			return
+		}
+		stopped = true
+		cancel()
+		<-done
+	}
+}
+
+// waitFor polls cond until it holds or the deadline passes.
+func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) time.Duration {
+	t.Helper()
+	start := time.Now()
+	for time.Since(start) < d {
+		if cond() {
+			return time.Since(start)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %v waiting for %s", d, what)
+	return 0
+}
+
+func TestWorkerIdleBackoff(t *testing.T) {
+	q, ctx := testDB(t)
+	q.db.Exec(ctx, "DELETE FROM schedules")
+
+	var runs atomic.Int64
+	reg := NewRegistry()
+	reg.Register("stub", stub{run: func(context.Context, Job) ([]byte, error) {
+		runs.Add(1)
+		return []byte(`{}`), nil
+	}})
+	opts := WorkerOptions{IdleMin: 10 * time.Millisecond, IdleMax: 200 * time.Millisecond}
+
+	// An idle worker must not spin. With a 200ms ceiling, one second of doing
+	// nothing is on the order of ten wake-ups, not thousands.
+	stop := runWorker(t, q, reg, opts)
+	time.Sleep(time.Second)
+	stop()
+	if n := claimAttempts(t, q, ctx); n > 40 {
+		t.Errorf("idle worker claimed %d times in 1s; backoff is not working", n)
+	}
+
+	// A job enqueued while the worker sits at full backoff is still picked up.
+	stop = runWorker(t, q, reg, opts)
+	defer stop()
+	time.Sleep(600 * time.Millisecond) // let it reach the ceiling
+	enqueue(t, q, ctx, "late")
+	waitFor(t, 3*time.Second, "a job enqueued during backoff to run", func() bool { return runs.Load() == 1 })
+
+	// Backoff resets after work, so a burst drains at full speed instead of
+	// each job waiting out a doubled pause.
+	for i := 0; i < 10; i++ {
+		enqueue(t, q, ctx, fmt.Sprintf("burst-%d", i))
+	}
+	el := waitFor(t, 5*time.Second, "a 10-job burst to drain", func() bool { return runs.Load() == 11 })
+	// Ten jobs at the 200ms ceiling would take ~2s; resetting makes it near-instant.
+	if el > time.Second {
+		t.Errorf("draining 10 ready jobs took %v; backoff is not resetting after work", el)
+	}
+}
+
+// claimAttempts counts how many times any job has been claimed, a proxy for
+// how often the worker has gone to the database looking for work.
+func claimAttempts(t *testing.T, q *Queue, ctx context.Context) int64 {
+	t.Helper()
+	var n int64
+	q.db.QueryRow(ctx, `SELECT COALESCE(sum(attempts),0) FROM jobs`).Scan(&n)
+	return n
+}
+
+func TestWorkerWakesForSchedule(t *testing.T) {
+	q, ctx := testDB(t)
+	q.db.Exec(ctx, "DELETE FROM schedules")
+	var runs atomic.Int64
+	reg := NewRegistry()
+	reg.Register("stub", stub{run: func(context.Context, Job) ([]byte, error) {
+		runs.Add(1)
+		return []byte(`{}`), nil
+	}})
+
+	if err := q.EnsureSchedule(ctx, Schedule{Name: "soon", Type: "stub", Interval: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.db.Exec(ctx, `UPDATE schedules SET next_at = now() + interval '400 milliseconds'`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both pauses are far longer than the 400ms until the schedule is due, so
+	// this only passes if the worker shortens its sleep to meet it.
+	stop := runWorker(t, q, reg, WorkerOptions{IdleMin: 5 * time.Second, IdleMax: time.Hour, Schedules: true})
+	defer stop()
+	waitFor(t, 4*time.Second, "the schedule to fire and run", func() bool { return runs.Load() == 1 })
+
+	var fired int
+	q.db.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE idempotency_key LIKE 'schedule:soon:%'`).Scan(&fired)
+	if fired != 1 {
+		t.Fatalf("schedule fired %d times, want 1", fired)
 	}
 }

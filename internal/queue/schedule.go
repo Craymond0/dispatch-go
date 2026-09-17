@@ -120,19 +120,3 @@ func (q *Queue) RunDue(ctx context.Context) (int, error) {
 	}
 	return n, tx.Commit(ctx)
 }
-
-// Scheduler ticks RunDue until ctx ends. Run it in every worker.
-func (q *Queue) Scheduler(ctx context.Context, tick time.Duration) {
-	t := time.NewTicker(tick)
-	defer t.Stop()
-	for {
-		if _, err := q.RunDue(ctx); err != nil && ctx.Err() == nil {
-			slog.Error("scheduler", "error", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-	}
-}

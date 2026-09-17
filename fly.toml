@@ -2,6 +2,9 @@
 # dashboard, "worker" runs the queue worker and the scheduler. Both read the
 # same Postgres; Neon's free tier carries this workload.
 #
+# primary_region sits next to the database (Neon us-east-2, Ohio) because
+# every job claim is a round trip to it.
+#
 #   fly launch --no-deploy --copy-config
 #   fly secrets set DATABASE_URL=... API_TOKEN=... SESSION_SECRET=... \
 #                   DASHBOARD_PASSWORD=... ANTHROPIC_API_KEY=...
@@ -11,7 +14,7 @@
 # The API suspends when idle and wakes on request. The worker stays up, since
 # it owns the scheduler that fires the recurring sweep.
 app = "dispatch-go"
-primary_region = "iad"
+primary_region = "ord"
 
 [build]
   dockerfile = "Dockerfile"
@@ -19,6 +22,12 @@ primary_region = "iad"
 [env]
   PORT = "8080"
   SWEEP_INTERVAL = "6h"
+  # How long the worker may sleep when there is nothing to do. This is the
+  # knob that decides hosting cost: a long pause lets a serverless Postgres
+  # suspend between sweeps, at the price of an ad-hoc job waiting up to this
+  # long to start. Lower it if you want snappier manual sweeps and are paying
+  # for always-on compute anyway.
+  WORKER_IDLE_MAX = "10m"
 
 # Both process groups run the same image; the argument selects the role.
 [processes]

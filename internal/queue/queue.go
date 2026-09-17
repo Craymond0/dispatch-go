@@ -294,22 +294,102 @@ func (q *Queue) RunOne(ctx context.Context, reg *Registry, j Job) {
 	}
 }
 
-func (q *Queue) Worker(ctx context.Context, reg *Registry) {
+// WorkerOptions tunes the idle behaviour of a worker loop.
+//
+// The defaults are deliberately not "poll as fast as possible". A worker that
+// queries every 250ms around the clock keeps a serverless Postgres awake
+// permanently, which on a metered plan costs far more than the work is worth.
+// Instead the loop polls tightly while there is work, then backs off
+// exponentially to IdleMax, and never sleeps past the next scheduled job.
+// Between sweeps it issues no queries at all, so pooled connections age out
+// and the database is free to suspend.
+//
+// The cost is latency on ad-hoc work: a job enqueued while the worker is at
+// full backoff waits up to IdleMax to start. That is the trade, and it is why
+// IdleMax is configurable rather than baked in.
+type WorkerOptions struct {
+	IdleMin time.Duration // first pause after finding nothing; default 250ms
+	IdleMax time.Duration // longest pause; default 30s
+	// Schedules, when true, also runs due schedules on each pass. Every worker
+	// may set this: RunDue takes an advisory lock, so only one fires each tick.
+	Schedules bool
+}
+
+func (o WorkerOptions) withDefaults() WorkerOptions {
+	if o.IdleMin <= 0 {
+		o.IdleMin = 250 * time.Millisecond
+	}
+	if o.IdleMax < o.IdleMin {
+		o.IdleMax = max(30*time.Second, o.IdleMin)
+	}
+	return o
+}
+
+// Worker claims and runs jobs until ctx ends, backing off when idle.
+func (q *Queue) Worker(ctx context.Context, reg *Registry, opts WorkerOptions) {
+	opts = opts.withDefaults()
+	backoff := opts.IdleMin
+	slog.Info("worker loop", "idle_min", opts.IdleMin, "idle_max", opts.IdleMax, "schedules", opts.Schedules)
 	for ctx.Err() == nil {
+		if opts.Schedules {
+			if n, err := q.RunDue(ctx); err != nil {
+				if ctx.Err() == nil {
+					slog.Error("scheduler", "error", err)
+				}
+			} else if n > 0 {
+				backoff = opts.IdleMin // something was just enqueued; go look for it
+			}
+		}
 		j, err := q.Claim(ctx)
-		if err != nil {
-			if !errors.Is(err, pgx.ErrNoRows) && ctx.Err() == nil {
-				slog.Error("claim", "error", err)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(250 * time.Millisecond):
-			}
+		if err == nil {
+			q.RunOne(ctx, reg, j)
+			backoff = opts.IdleMin
 			continue
 		}
-		q.RunOne(ctx, reg, j)
+		if !errors.Is(err, pgx.ErrNoRows) && ctx.Err() == nil {
+			slog.Error("claim", "error", err)
+		}
+		q.idle(ctx, opts, &backoff)
 	}
+}
+
+// idle sleeps for the current backoff, shortened so the loop wakes in time for
+// the next scheduled job, then doubles the backoff up to IdleMax.
+func (q *Queue) idle(ctx context.Context, opts WorkerOptions, backoff *time.Duration) {
+	wait := *backoff
+	if opts.Schedules {
+		// Shorten the sleep to meet the next schedule. The floor is a small
+		// constant, not IdleMin: clamping back up to IdleMin would let a
+		// worker with a long IdleMin sleep straight through a schedule, which
+		// is the bug this line exists to prevent. The floor only stops a hot
+		// loop when a schedule is overdue but another worker keeps winning
+		// the tick.
+		if until, ok := q.untilNextSchedule(ctx); ok && until < wait {
+			wait = max(until, 100*time.Millisecond)
+		}
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(wait):
+	}
+	if *backoff < opts.IdleMax {
+		*backoff = min(*backoff*2, opts.IdleMax)
+	}
+}
+
+// untilNextSchedule reports how long until the soonest enabled schedule is due.
+// A schedule already overdue returns 0. ok is false when there are none, or the
+// query failed, in which case the caller just uses its backoff.
+func (q *Queue) untilNextSchedule(ctx context.Context) (time.Duration, bool) {
+	var secs *float64
+	err := q.db.QueryRow(ctx, `SELECT EXTRACT(EPOCH FROM (min(next_at) - now())) FROM schedules WHERE enabled`).Scan(&secs)
+	if err != nil || secs == nil {
+		return 0, false
+	}
+	if *secs <= 0 {
+		return 0, true
+	}
+	return time.Duration(*secs * float64(time.Second)), true
 }
 
 // List returns the most recent jobs, newest first.

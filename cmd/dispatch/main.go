@@ -22,6 +22,15 @@ import (
 	"dispatch/internal/web"
 )
 
+// durationEnv reads a Go duration (e.g. "10m") and falls back on anything
+// unparseable rather than failing to boot over a typo.
+func durationEnv(k string, fallback time.Duration) time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(k)); err == nil && d > 0 {
+		return d
+	}
+	return fallback
+}
+
 func env(k, v string) string {
 	if x := os.Getenv(k); x != "" {
 		return x
@@ -42,7 +51,18 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	db, err := pgxpool.New(ctx, env("DATABASE_URL", "postgres://dispatch:dispatch@localhost:5432/dispatch?sslmode=disable"))
+	cfg, err := pgxpool.ParseConfig(env("DATABASE_URL", "postgres://dispatch:dispatch@localhost:5432/dispatch?sslmode=disable"))
+	if err != nil {
+		panic(err)
+	}
+	// Hold no idle connections. A serverless Postgres only suspends once
+	// nothing is connected, so a pool that keeps one warm forever would
+	// defeat the whole point of the worker's idle backoff.
+	cfg.MinConns = 0
+	cfg.MaxConns = 4
+	cfg.MaxConnIdleTime = 30 * time.Second
+	cfg.MaxConnLifetime = 30 * time.Minute
+	db, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		panic(err)
 	}
@@ -71,8 +91,15 @@ func main() {
 	}
 	if role == "worker" {
 		slog.Info("worker started", "handlers", reg.Names())
-		go q.Scheduler(ctx, 30*time.Second)
-		q.Worker(ctx, reg)
+		// IdleMax is the knob that decides hosting cost. On a serverless
+		// Postgres that bills for time awake, a long idle pause lets the
+		// database suspend between sweeps; the price is that an ad-hoc job
+		// waits up to this long to start.
+		q.Worker(ctx, reg, queue.WorkerOptions{
+			IdleMin:   durationEnv("WORKER_IDLE_MIN", 250*time.Millisecond),
+			IdleMax:   durationEnv("WORKER_IDLE_MAX", 10*time.Minute),
+			Schedules: true,
+		})
 		return
 	}
 	token := os.Getenv("API_TOKEN")
