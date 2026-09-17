@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"dispatch/internal/llm"
@@ -334,6 +335,18 @@ func (t *Tracker) getState(ctx context.Context, key string) string {
 }
 
 func (t *Tracker) setState(ctx context.Context, key, value string) error {
-	_, err := t.db().Exec(ctx, `INSERT INTO tracker_state(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`, key, value)
+	return setState(ctx, t.db(), key, value)
+}
+
+// execer is whatever can run a statement: the pool, or a transaction. State
+// that must land atomically with the rows it describes -- a feed ETag, which
+// is a promise that everything the feed listed is already stored -- is written
+// through the same transaction as those rows.
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func setState(ctx context.Context, db execer, key, value string) error {
+	_, err := db.Exec(ctx, `INSERT INTO tracker_state(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`, key, value)
 	return err
 }

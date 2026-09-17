@@ -92,11 +92,18 @@ func (h feedPoll) Run(ctx context.Context, j queue.Job) ([]byte, error) {
 		}
 		total.Closed += r.Closed
 	}
+	// Inside the transaction, deliberately. The ETag is a claim that every
+	// posting the feed listed is already stored; committing it separately
+	// means a crash, or a lost lease, between the two writes leaves the ETag
+	// saved and the postings not. The next poll would then get a 304 and
+	// skip work it never actually did.
+	if etag != "" {
+		if err := setState(ctx, tx, "feed.etag", etag); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
-	}
-	if etag != "" {
-		t.setState(ctx, "feed.etag", etag)
 	}
 	return json.Marshal(map[string]any{"companies": companies, "seen": total.Seen, "new": total.New, "updated": total.Updated, "closed": total.Closed})
 }
