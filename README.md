@@ -113,6 +113,14 @@ The sweep runs on a schedule (`SWEEP_INTERVAL`, default 6h). Every worker ticks 
 
 Outbound requests go through a per-host token bucket (2 req/s, burst 4), so a sweep that fans out into fifty board polls cannot hammer one API.
 
+### Idle cost
+
+The worker does not poll in a tight loop. It claims at `WORKER_IDLE_MIN` (250ms) while there is work and backs off exponentially to `WORKER_IDLE_MAX` (10m) when there is not, resetting the moment anything runs, and it never sleeps past the next scheduled job. The connection pool holds no idle connections.
+
+That combination is what makes this cheap to run. A serverless Postgres only suspends once nothing is connected, so a worker polling every 250ms keeps it awake all month whether or not there is anything to do. Four sweeps a day is a few minutes of real work; billing for 730 hours to do it is the difference between roughly $4 and roughly $24 a month.
+
+The cost is latency on ad-hoc work: a job enqueued while the worker is at full backoff waits up to `WORKER_IDLE_MAX` to start. Scheduled sweeps and the digest are unaffected. Lower it if you are paying for always-on compute anyway and want manual sweeps to feel instant.
+
 When a digest has anything to report it queues a `notify.email` job. With `RESEND_API_KEY`, `DIGEST_FROM` and `DIGEST_TO` set it sends through Resend, passing the same idempotency key to the provider so a retried send cannot deliver twice; unset, the job succeeds as skipped so a missing key never poisons a sweep.
 
 Child jobs use idempotency keys derived from the sweep's own job id, so a sweep retried after a partial failure re-finds its children instead of duplicating them.
