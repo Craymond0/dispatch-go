@@ -21,6 +21,13 @@ import (
 // A worker is "killed" by abandoning its in-flight job without calling
 // Finish, which is what SIGKILL, an OOM or a severed connection look like to
 // the database. The lease is shortened so reclaims happen in milliseconds.
+//
+// This drives Claim and Finish directly rather than RunOne, so no lease is
+// renewed. That is the point: renewal keeps a live worker's claim alive, and
+// a dead one renews nothing, so the reclaim path this exercises is the one
+// that still runs in production. The fence remains the last line of defence
+// for the case renewal cannot cover -- a worker paused long enough by a stall
+// or a partition that its lease lapses before it notices.
 func TestChaosNoLostOrDuplicatedWork(t *testing.T) {
 	q, ctx := testDB(t)
 	prev := leaseDuration

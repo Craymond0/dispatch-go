@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -271,18 +272,37 @@ func (q *Queue) Finish(ctx context.Context, j Job, result []byte, jobErr error) 
 // failure: retrying would only reach the same binary.
 func (q *Queue) RunOne(ctx context.Context, reg *Registry, j Job) {
 	slog.Info("job started", "job_id", j.ID, "type", j.Type, "attempt", j.Attempts)
-	var result []byte
-	var err error
-	if h, ok := reg.Get(j.Type); ok {
-		result, err = h.Run(ctx, j)
-	} else {
-		err = Terminal(fmt.Errorf("no handler registered for type %q", j.Type))
+	h, ok := reg.Get(j.Type)
+	if !ok {
+		q.report(ctx, j, nil, Terminal(fmt.Errorf("no handler registered for type %q", j.Type)))
+		return
 	}
+	// The lease is renewed underneath the handler for as long as it runs, so a
+	// job that legitimately takes longer than leaseDuration is not reclaimed
+	// out from under it. Without this every handler would need to finish
+	// inside one lease, which is not a constraint the caller can always meet:
+	// a feed poll that downloads megabytes and reconciles thousands of rows
+	// routinely runs for minutes.
+	runCtx, lease := q.keepAlive(ctx, j)
+	result, err := h.Run(runCtx, j)
+	held := lease()
 	if ctx.Err() != nil {
 		// Shutting down mid-job: leave the lease to expire so another worker
 		// picks it up, rather than recording a spurious failure.
 		return
 	}
+	if !held {
+		// Renewal failed, which means the row no longer matches this attempt:
+		// another worker owns the job now. Reporting would be rejected by the
+		// fence anyway, so say so once and stay quiet.
+		slog.Warn("lease lost while running; job reclaimed", "job_id", j.ID, "type", j.Type, "attempt", j.Attempts)
+		return
+	}
+	q.report(ctx, j, result, err)
+}
+
+// report records an attempt's outcome and logs it.
+func (q *Queue) report(ctx context.Context, j Job, result []byte, err error) {
 	if ferr := q.Finish(ctx, j, result, err); ferr != nil {
 		slog.Error("completion", "job_id", j.ID, "error", ferr)
 		return
@@ -291,6 +311,52 @@ func (q *Queue) RunOne(ctx context.Context, reg *Registry, j Job) {
 		slog.Warn("job failed", "job_id", j.ID, "attempt", j.Attempts, "terminal", IsTerminal(err), "error", err)
 	} else {
 		slog.Info("job completed", "job_id", j.ID, "attempt", j.Attempts)
+	}
+}
+
+// keepAlive extends a claimed job's lease in the background until the returned
+// stop function is called, and returns a context that is cancelled the moment
+// the lease is lost. The renewal is fenced exactly as Finish is: it only
+// touches the row while it still records this attempt as running, so a worker
+// that was already reclaimed cannot resurrect its claim.
+//
+// stop halts the renewal, waits for it, and reports whether the lease was held
+// the whole time. A false means the handler's work is void: another worker has
+// the job.
+func (q *Queue) keepAlive(ctx context.Context, j Job) (context.Context, func() bool) {
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	var lost atomic.Bool
+	go func() {
+		defer close(done)
+		// Renew well inside the lease so a slow round trip, or one skipped
+		// tick, still leaves time before it lapses.
+		tick := time.NewTicker(leaseDuration / 3)
+		defer tick.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-tick.C:
+			}
+			tag, err := q.db.Exec(ctx, `UPDATE jobs SET lease_until=now()+$1::interval WHERE id=$2 AND attempts=$3 AND state='running' AND lease_until>now()`, leaseDuration, j.ID, j.Attempts)
+			if err != nil {
+				// A transient database error is not proof the lease is gone.
+				// Two-thirds of it remain; try again on the next tick.
+				slog.Warn("lease renewal failed", "job_id", j.ID, "error", err)
+				continue
+			}
+			if tag.RowsAffected() != 1 {
+				lost.Store(true)
+				cancel()
+				return
+			}
+		}
+	}()
+	return runCtx, func() bool {
+		cancel()
+		<-done
+		return !lost.Load()
 	}
 }
 

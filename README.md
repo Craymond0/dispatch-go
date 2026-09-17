@@ -160,7 +160,8 @@ The analyzer uses a small literal technology dictionary. It does not score candi
 
 - PostgreSQL persists payloads, results, retry state and completion events.
 - Atomic claims use row locks and SKIP LOCKED across independent workers.
-- 45-second leases reclaim abandoned work after a crash. There is no lease renewal, so a handler that runs longer than the lease will have its job reassigned under it; every current handler finishes well inside it.
+- 45-second leases reclaim abandoned work after a crash. A running job's lease is renewed in the background every 15 seconds, so a handler that legitimately takes minutes is not reclaimed underneath it. If a renewal ever fails the row no longer matches this attempt, which means another worker already owns the job, so the handler's context is cancelled rather than left to produce a result nobody will accept.
+- The lease is the crash detector, not a deadline: it lapses only when the worker stops renewing, which is exactly when the worker has died.
 - Attempt numbers fence stale workers from committing results after reassignment.
 - Failures retry with exponential delays up to three attempts, then remain visible as failed jobs. A handler can return `Terminal(err)` for failures that retrying cannot fix (malformed input, a permanent 404); those fail on the spot with a `failed_terminal` event and no further attempts.
 - Idempotency keys deduplicate submissions and reject a different type or payload using the same key. Without a key, one is derived from the type and the canonicalised payload, so key order in the JSON does not matter.
