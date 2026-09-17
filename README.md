@@ -91,6 +91,8 @@ web/                React + TypeScript dashboard (Vite)
 | `ANTHROPIC_MODEL` | Defaults to `claude-sonnet-5` |
 | `RESEND_API_KEY`, `DIGEST_FROM`, `DIGEST_TO` | Email digests; all three or none |
 | `SWEEP_INTERVAL` | Default `6h` |
+| `WORKER_IDLE_MIN` | Poll interval while there is work; default `250ms` |
+| `WORKER_IDLE_MAX` | Longest idle pause; default `10m`. See Idle cost below |
 | `FEED_URL` | Override the job feed (tests, mirrors) |
 
 ## Handlers
